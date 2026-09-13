@@ -1,3 +1,5 @@
 numpy>=1.26
 aiohttp>=3.9
 python-dotenv>=1.0
+scikit-learn>=1.9
+joblib>=1.3

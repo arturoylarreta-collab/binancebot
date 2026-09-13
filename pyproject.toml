@@ -5,12 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "crypto-scalper"
 version = "0.1.0"
-description = "Modular, quantitative, async crypto scalping research system (FASE 1/2: architecture + market data pipeline)"
+description = "Modular, quantitative, async crypto scalping research system (FASE 1/2: architecture + market data, FASE 3: signals, FASE 4: ML filter)"
 requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.26",
     "aiohttp>=3.9",
     "python-dotenv>=1.0",
+    "scikit-learn>=1.9",
+    "joblib>=1.3",
 ]
 
 [project.optional-dependencies]
@@ -25,3 +27,6 @@ include = ["crypto_scalper*"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "slow: longer-running end-to-end ML fits (deselect with -m 'not slow')",
+]
