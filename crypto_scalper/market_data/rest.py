@@ -134,10 +134,23 @@ class BinanceFuturesRest:
             "/fapi/v1/aggTrades", {"symbol": symbol, "limit": limit}, weight=_agg_trades_weight(limit)
         )
 
-    async def klines(self, symbol: str, interval: str = "1m", limit: int = 100) -> List[List[Any]]:
+    async def klines(
+        self,
+        symbol: str,
+        interval: str = "1m",
+        limit: int = 100,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+    ) -> List[List[Any]]:
+        """Kline history. Paging (FASE 8) uses start_time/end_time in ms."""
+        params: Dict[str, Any] = {"symbol": symbol, "interval": interval, "limit": limit}
+        if start_time is not None:
+            params["startTime"] = start_time
+        if end_time is not None:
+            params["endTime"] = end_time
         return await self._get(
             "/fapi/v1/klines",
-            {"symbol": symbol, "interval": interval, "limit": limit},
+            params,
             weight=_klines_weight(limit),
         )
 

@@ -141,3 +141,11 @@ class PositionNotProtectedError(ExecutionError, Fatal):
 
 class ReconciliationMismatchError(ExecutionError, Fatal):
     pass
+
+
+class InvalidOrderError(ExecutionError):
+    """Validation failure: missing client_order_id, zero qty, etc."""
+
+
+class ProtectionTimeoutError(ExecutionError, Fatal):
+    """SL/TP not confirmed within timeout after entry fill."""

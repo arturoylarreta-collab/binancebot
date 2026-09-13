@@ -89,6 +89,15 @@ class SignalType(Enum):
     FLAT = auto()
 
 
+class PositionStatus(Enum):
+    ENTRY_SUBMITTED = auto()
+    ENTRY_FILLED = auto()
+    PROTECTING = auto()
+    ACTIVE = auto()
+    CLOSED = auto()
+    ABORTED = auto()
+
+
 class FeatureCategory(Enum):
     PRICE = auto()
     VOLUME = auto()

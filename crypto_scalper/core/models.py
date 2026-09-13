@@ -10,7 +10,13 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
 
-from crypto_scalper.core.enums import AggressorSide, Impact, Regime, SignalType
+from crypto_scalper.core.enums import (
+    AggressorSide,
+    Impact,
+    PositionStatus,
+    Regime,
+    SignalType,
+)
 
 
 def now_utc_ms() -> int:
@@ -227,6 +233,94 @@ class OrderRequest:
     requested_ts_ms: int = 0
 
 
+# ── Execution (FASE 6) ───────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class Fill:
+    """One execution leg of an order (liquidity event)."""
+
+    symbol: str
+    client_order_id: str
+    side: str
+    quantity: float
+    price: float
+    ts_ms: int
+    order_id: str = ""
+    fee: float = 0.0
+    fee_asset: str = "USDT"
+
+
+@dataclass(frozen=True)
+class ExecutionReport:
+    """Adapter-level snapshot of an order: status, executed qty, fills.
+
+    Returned by ExchangeAdapter.{submit,cancel,get_order} and emitted as an
+    event when status changes. `order_id` is the exchange-assigned id
+    (simulated adapters generate one deterministically).
+    """
+
+    order_id: str
+    client_order_id: str
+    symbol: str
+    side: str
+    order_type: str
+    status: str              # OrderStatus.name
+    original_quantity: float
+    executed_quantity: float
+    avg_price: float
+    fills: Tuple["Fill", ...] = ()
+    reject_reason: str = ""
+    ts_ms: int = 0
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status in {
+            "FILLED",
+            "PARTIALLY_FILLED_CANCELED",
+            "CANCELED",
+            "REJECTED",
+            "EXPIRED",
+            "NEW_INSURANCE",
+            "NEW_ADL",
+        }
+
+    @property
+    def become_filled(self) -> bool:
+        return self.fills != () and self.executed_quantity > 0
+
+
+@dataclass
+class ManagedPosition:
+    """Execution-tracked position owned by the PositionManager.
+
+    Mutable: status evolves ENTRY_SUBMITTED → ACTIVE → CLOSED/ABORTED. The
+    invariant is that a position is only ever ACTIVE when both its stop-loss
+    and take-profit protection orders are resting on the exchange.
+    """
+
+    position_id: str
+    symbol: str
+    side: str                    # "BUY" | "SELL"
+    quantity: float              # filled quantity under protection
+    ordered_quantity: float
+    entry_price: float
+    stop_loss_price: float
+    take_profit_price: float
+    notional_value: float
+    risk_amount: float
+    regime: str
+    status: PositionStatus
+    entry_client_order_id: str
+    stop_client_order_id: str = ""
+    take_profit_client_order_id: str = ""
+    entry_order_id: str = ""
+    opened_ts_ms: int = 0
+    closed_ts_ms: int = 0
+    realized_pnl: float = 0.0
+    close_reason: str = ""
+
+
 # ── Risk ───────────────────────────────────────────────────────────────────────
 
 
@@ -238,6 +332,29 @@ class RiskDecision:
     reason: str = ""
     verifier: str = "risk_engine"
     details: Dict[str, Any] = field(default_factory=dict)
+    # FASE 5: position sizing, SL, TP — present when APPROVED
+    position_size: Optional[float] = None
+    stop_loss_price: Optional[float] = None
+    take_profit_price: Optional[float] = None
+    notional_value: Optional[float] = None
+    risk_amount: Optional[float] = None
+    leverage_used: int = 1
+    risk_checks: Dict[str, bool] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class HeartbeatSnapshot:
+    ts_ms: int
+    mode: str
+    status: str
+    equity: float
+    realized_pnl: float
+    unrealized_pnl: float
+    drawdown_pct: float
+    total_exposure: float
+    open_count: int
+    trades_today: int
+    uptime_ms: int = 0
 
 
 # ── Latency ────────────────────────────────────────────────────────────────────
