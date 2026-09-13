@@ -1,11 +1,13 @@
 from dataclasses import dataclass, field
+import json as _json
 import os
 from pathlib import Path
 from typing import List, Optional
 
 from dotenv import load_dotenv
 
-from crypto_scalper.core.enums import Environment
+from crypto_scalper.config.strategies import DEFAULT_SIGNAL_WEIGHTS, StrategyConfig
+from crypto_scalper.core.enums import Environment, Regime
 from crypto_scalper.core.exceptions import ConfigurationError
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -103,8 +105,8 @@ class Settings:
     log_format: str
     log_dir: Path
     explicit_symbols: List[str] = field(default_factory=list)
-    # Holds raw optional fields so later phases can extend without breaking.
     extras: dict = field(default_factory=dict)
+    strategies: StrategyConfig = field(default_factory=StrategyConfig)
 
     @classmethod
     def load(cls) -> "Settings":
@@ -159,7 +161,44 @@ class Settings:
             log_format=_as_str("LOG_FORMAT", "kv"),
             log_dir=Path(_as_str("LOG_DIR", "logs")),
             explicit_symbols=explicit,
+            strategies=_load_strategy_config(),
         )
+
+
+def _load_strategy_config() -> StrategyConfig:
+    weights = dict(DEFAULT_SIGNAL_WEIGHTS)
+    raw_weights = _as_str("SIGNAL_WEIGHTS_JSON", "")
+    if raw_weights:
+        try:
+            parsed = _json.loads(raw_weights)
+        except ValueError:
+            raise ConfigurationError("SIGNAL_WEIGHTS_JSON must be a valid JSON object")
+        if not isinstance(parsed, dict):
+            raise ConfigurationError("SIGNAL_WEIGHTS_JSON must be a JSON object")
+        for key, value in parsed.items():
+            try:
+                weights[key] = float(value)
+            except (TypeError, ValueError):
+                raise ConfigurationError(
+                    f"SIGNAL_WEIGHTS_JSON key {key!r} must map to a number"
+                )
+
+    allowed_raw = _as_str("STRATEGY_ALLOWED_REGIMES", "")
+    allowed = tuple(
+        r.strip().lower() for r in allowed_raw.split(",") if r.strip()
+    )
+    known = {r.name.lower() for r in Regime}
+    for r in allowed:
+        if r not in known:
+            raise ConfigurationError(f"unknown regime in STRATEGY_ALLOWED_REGIMES: {r}")
+
+    return StrategyConfig(
+        enabled=_as_bool("STRATEGY_ENABLED", False),
+        allowed_regimes=allowed,
+        signal_weights=weights,
+        long_threshold=_as_float("STRATEGY_LONG_THRESHOLD", 60.0),
+        short_threshold=_as_float("STRATEGY_SHORT_THRESHOLD", 40.0),
+    )
 
 
 def _validate_ws_numbers() -> None:

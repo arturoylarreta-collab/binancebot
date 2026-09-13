@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import json
 import logging
 import signal
@@ -40,18 +41,19 @@ from crypto_scalper.market_data.websocket import WebSocketManager
 from crypto_scalper.monitoring.logger import setup_logging
 from crypto_scalper.monitoring.metrics import METRICS
 from crypto_scalper.storage.base import NoopRepository, Repository
+from crypto_scalper.strategies.signal_engine import SignalEngine
 
 log = logging.getLogger(__name__)
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="crypto_scalper FASE 2 pipeline")
+    p = argparse.ArgumentParser(description="crypto_scalper FASE 2/3 pipeline")
     p.add_argument("--env", default=None, help="dev | paper | live")
     p.add_argument(
         "--mode",
         default="pipeline",
-        choices=["pipeline", "one-shot"],
-        help="one-shot prints a single FeatureSnapshot and exits",
+        choices=["pipeline", "one-shot", "signal"],
+        help="one-shot prints a FeatureSnapshot; signal adds the Signal breakdown",
     )
     p.add_argument("--symbols", default="", help="comma-separated override")
     p.add_argument("--log-dir", default="", help="override log directory")
@@ -76,6 +78,9 @@ async def run(args: argparse.Namespace) -> int:
 
     if args.mode == "one-shot":
         return await run_one_shot(settings)
+
+    if args.mode == "signal":
+        return await run_signal_demo(settings)
 
     return await run_pipeline(settings)
 
@@ -125,6 +130,7 @@ async def run_pipeline(settings: Settings) -> int:
 
         engine = FeatureEngine(settings.features, news_store, METRICS)
         feature_out: asyncio.Queue = asyncio.Queue(maxsize=10_000)
+        signal_engine = SignalEngine(settings.strategies)
 
         workers = [
             asyncio.create_task(
@@ -132,7 +138,9 @@ async def run_pipeline(settings: Settings) -> int:
             )
             for s in symbols
         ]
-        sink = asyncio.create_task(_feature_sink(feature_out, repo, stop_event))
+        sink = asyncio.create_task(
+            _feature_sink(feature_out, repo, signal_engine, stop_event)
+        )
         metrics_task = asyncio.create_task(_metrics_summary(stop_event))
         ws = WebSocketManager(settings.ws, bus, METRICS)
         ws_task = asyncio.create_task(ws.run(symbols, stop_event))
@@ -180,6 +188,7 @@ async def _feature_worker(
 async def _feature_sink(
     in_q: asyncio.Queue,
     repo: Repository,
+    signal_engine: SignalEngine,
     stop_event: asyncio.Event,
 ) -> None:
     while not stop_event.is_set():
@@ -190,6 +199,41 @@ async def _feature_sink(
         METRICS.incr("features.snapshots")
         METRICS.record("feature.to_decision_us", _latency_us(snapshot.timestamp_ms))
         await repo.save_feature_snapshot(snapshot)
+        METRICS.incr("signals.evaluated")
+        signal = signal_engine.evaluate(snapshot)
+        if signal.eligible:
+            METRICS.incr("signals.eligible")
+        else:
+            METRICS.incr("signals.gated")
+        _log_signal(signal, snapshot)
+
+
+def _log_signal(signal, snapshot: FeatureSnapshot) -> None:
+    comp = signal.components
+    log.info(
+        "signal generated",
+        extra={
+            "symbol": signal.symbol,
+            "side": signal.signal_type.name,
+            "score": round(signal.score, 3),
+            "regime": signal.regime,
+            "eligible": signal.eligible,
+            "reason": signal.reason,
+            "trend": round(comp["trend"].score, 2) if "trend" in comp else None,
+            "momentum": round(comp["momentum"].score, 2) if "momentum" in comp else None,
+            "volume": round(comp["volume"].score, 2) if "volume" in comp else None,
+            "order_book": round(comp["order_book"].score, 2) if "order_book" in comp else None,
+            "volatility": round(comp["volatility"].score, 2) if "volatility" in comp else None,
+            "price_structure": round(comp["price_structure"].score, 2) if "price_structure" in comp else None,
+            "news": round(comp["news"].score, 2) if "news" in comp else None,
+            "ml": round(comp["ml"].score, 2) if "ml" in comp else None,
+            "rsi": round(snapshot.rsi, 2),
+            "obi": round(snapshot.order_book_imbalance, 4),
+            "volume_zscore": round(snapshot.volume_zscore, 2),
+            "spread_pct": round(snapshot.spread_pct, 5),
+            "news_sentiment": round(snapshot.news_sentiment, 3),
+        },
+    )
 
 
 async def _metrics_summary(stop_event: asyncio.Event) -> None:
@@ -217,6 +261,31 @@ async def run_one_shot(settings: Settings) -> int:
         return 0
     except (ExchangeConnectionError, MarketDataNotReady, UniverseEmptyError) as exc:
         log.error("one-shot failed", extra={"error": str(exc)})
+        return 1
+    finally:
+        await rest.close()
+
+
+# ── Signal demo (FASE 3 verification) ─────────────────────────────────────────
+
+
+async def run_signal_demo(settings: Settings) -> int:
+    rest = BinanceFuturesRest(settings.rest_url)
+    news_store = NewsStore()
+    try:
+        await rest.start()
+        symbols = await _resolve_universe(settings, rest)
+        if not symbols:
+            raise UniverseEmptyError("no symbols selected")
+        state = await _build_state_from_rest(rest, symbols[0])
+        engine = FeatureEngine(settings.features, news_store, METRICS)
+        snapshot = engine.compute(state)
+        demo_strategy = dataclasses.replace(settings.strategies, enabled=True)
+        signal = SignalEngine(demo_strategy).evaluate(snapshot)
+        print(json.dumps({"snapshot": snapshot.to_dict(), "signal": signal.to_dict()}, indent=2))
+        return 0
+    except (ExchangeConnectionError, MarketDataNotReady, UniverseEmptyError) as exc:
+        log.error("signal demo failed", extra={"error": str(exc)})
         return 1
     finally:
         await rest.close()

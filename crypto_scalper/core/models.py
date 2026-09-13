@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
 
-from crypto_scalper.core.enums import AggressorSide, Impact, Regime
+from crypto_scalper.core.enums import AggressorSide, Impact, Regime, SignalType
 
 
 def now_utc_ms() -> int:
@@ -147,6 +147,7 @@ class FeatureSnapshot:
     mention_zscore: float
     regime: str
     extra: Dict[str, Any] = field(default_factory=dict)
+    features_by_category: Dict[str, Dict[str, float]] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {}
@@ -154,7 +155,52 @@ class FeatureSnapshot:
             v = getattr(self, f)
             if isinstance(v, (int, float, str, bool)) or v is None:
                 d[f] = v
+            elif isinstance(v, dict):
+                d[f] = {k: vv for k, vv in v.items() if isinstance(vv, (int, float, str, bool))}
         return d
+
+
+@dataclass(frozen=True)
+class SignalComponent:
+    """One dimension of a Signal Score (0-100, higher = more bullish)."""
+
+    name: str
+    score: float
+    weight: float
+    detail: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Signal:
+    """A non-binary signal: score, direction, per-dimension breakdown.
+
+    Produced by the Signal Engine (FASE 3) from a FeatureSnapshot. Never
+    generates orders on its own; Risk Engine (FASE 5) keeps final authority.
+    """
+
+    symbol: str
+    timestamp_ms: int
+    signal_type: SignalType
+    score: float
+    regime: str
+    eligible: bool
+    reason: str = ""
+    components: Dict[str, SignalComponent] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "timestamp_ms": self.timestamp_ms,
+            "signal_type": self.signal_type.name,
+            "score": self.score,
+            "regime": self.regime,
+            "eligible": self.eligible,
+            "reason": self.reason,
+            "components": {
+                name: {"score": c.score, "weight": c.weight, "detail": c.detail}
+                for name, c in self.components.items()
+            },
+        }
 
 
 @dataclass(frozen=True)

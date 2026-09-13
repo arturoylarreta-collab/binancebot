@@ -4,14 +4,17 @@ Pipeline: Market State + latest relevant news + social/trending state.
 The news item is only fused if fresh (TTL enforced by NewsStore); old news
 is never mixed into a new decision snapshot.
 
-No future information enters here: every input was available at now_ms.
+FASE 3 additionally emits every feature grouped by category (PRICE, VOLUME,
+VOLATILITY, ORDER FLOW, ORDER BOOK, MOMENTUM, TREND, SOCIAL, NEWS, MARKET
+REGIME), all timestamped with the same `now_ms`: no future information is
+available at that instant.
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from typing import Dict, Optional
+from typing import TYPE_CHECKING, Dict, Optional
 
 import numpy as np
 
@@ -20,10 +23,13 @@ from crypto_scalper.core.models import FeatureSnapshot, OrderBookMetrics
 from crypto_scalper.core.enums import Impact, Regime
 from crypto_scalper.core.exceptions import MarketDataNotReady
 from crypto_scalper.external_data.store import NewsStore
-from crypto_scalper.features import price_features, technicals as t, volatility, volume_features
+from crypto_scalper.features import categories, price_features, technicals as t, volatility, volume_features
 from crypto_scalper.features.regime import MarketRegime
 from crypto_scalper.market_data.state import SymbolState
 from crypto_scalper.monitoring.metrics import Metrics
+
+if TYPE_CHECKING:
+    from crypto_scalper.ml.predictor import MLPredictor
 
 log = logging.getLogger(__name__)
 
@@ -35,11 +41,14 @@ class FeatureEngine:
         news_store: NewsStore,
         metrics: Metrics,
         regime_classifier: Optional[MarketRegime] = None,
+        predictor: Optional["MLPredictor"] = None,
     ) -> None:
         self._config = config
         self._news = news_store
         self._metrics = metrics
         self._regime = regime_classifier or MarketRegime()
+        self._last_obi: Dict[str, float] = {}
+        self._predictor = predictor
 
     def compute(self, state: SymbolState, now_ms: Optional[int] = None) -> FeatureSnapshot:
         now_ms = now_ms or int(time.time() * 1000)
@@ -58,13 +67,22 @@ class FeatureEngine:
         adx = _fallback(t.adx(high, low, close, 14), 0.0)
         boll_upper, boll_mid, boll_lower = t.bollinger(close, 20, 2.0)
         boll_upper_f = _nan_to(boll_upper, price)
+        boll_mid_f = _nan_to(boll_mid, price)
         boll_lower_f = _nan_to(boll_lower, price)
 
         vol_features = volatility.volatility_features(high, low, close)
         atr, atr_pct = vol_features["atr"], vol_features["atr_pct"]
+        realized_vol = vol_features["realized_volatility"]
 
         vwap = t.session_vwap(series.ts, typical, series.volume)
         vwap_f = _nan_to(vwap, price)
+
+        pf = price_features.price_features(close, high, low)
+        roc10 = pf.get("roc_10", 0.0)
+        if roc10 is None or (isinstance(roc10, float) and (np.isnan(roc10) or np.isinf(roc10))):
+            roc10 = 0.0
+        roc30 = _nan_to(t.roc(close, 30), 0.0)
+        roc60 = _nan_to(t.roc(close, 60), 0.0)
 
         vol = volume_features.volume_features(state.trades, now_ms)
 
@@ -81,11 +99,18 @@ class FeatureEngine:
         bid_depth = ob.bid_depth if ob else 0.0
         ask_depth = ob.ask_depth if ob else 0.0
 
+        obi_delta = 0.0
+        if ob is not None:
+            prev = self._last_obi.get(state.symbol)
+            obi_delta = (obi - prev) if prev is not None else 0.0
+            self._last_obi[state.symbol] = obi
+
         news = self._news.latest(state.symbol, now_ms=now_ms)
         news_sentiment = news.sentiment if news else 0.0
         news_impact = news.impact.name.lower() if news else Impact.LOW.name.lower()
         news_age = news.age_ms(now_ms) if news else 0
         mention_zscore = self._news.mention_zscore(state.symbol)
+        news_count = self._news.recent_count(state.symbol, now_ms=now_ms)
 
         regime = self._regime.classify(
             price=price,
@@ -98,10 +123,47 @@ class FeatureEngine:
             boll_lower=boll_lower_f,
         )
 
+        features_by_category = categories.build_all(
+            state=state,
+            price=price,
+            close=close,
+            high=high,
+            low=low,
+            vwap=vwap_f,
+            ema9=ema9,
+            ema21=ema21,
+            ema50=ema50,
+            rsi=rsi,
+            adx=adx,
+            roc10=float(roc10),
+            roc30=roc30,
+            roc60=roc60,
+            boll_upper=boll_upper_f,
+            boll_mid=boll_mid_f,
+            boll_lower=boll_lower_f,
+            atr=atr,
+            atr_pct=atr_pct,
+            realized_vol=realized_vol,
+            vol=vol,
+            ob=ob,
+            obi_delta=obi_delta,
+            news=news,
+            mention_zscore=mention_zscore,
+            news_count=news_count,
+            now_ms=now_ms,
+            ttl_ms=self._news.ttl_ms,
+            regime=regime,
+        )
+
+        if self._predictor is not None:
+            features_by_category["ml"] = dict(
+                self._predictor.category(features_by_category)
+            )
+
         extra: Dict[str, float] = {
             "ob_levels": float(ob.levels) if ob else 0.0,
-            "price_features": price_features.price_features(close, high, low),
-            "realized_volatility": vol_features["realized_volatility"],
+            "price_features": pf,
+            "realized_volatility": realized_vol,
             "volume_acceleration": vol.get("volume_acceleration", 0.0),
             "buy_ratio_30s": vol.get("buy_ratio_30s", 0.0),
             "depth_pct0005": float(ob.depth_pct0005 or 0.0) if ob else 0.0,
@@ -124,7 +186,7 @@ class FeatureEngine:
             ema50=ema50,
             adx=adx,
             boll_upper=boll_upper_f,
-            boll_mid=_nan_to(boll_mid, price),
+            boll_mid=boll_mid_f,
             boll_lower=boll_lower_f,
             roc=_fallback(t.roc(close, 10), 0.0),
             volume_zscore=vol.get("volume_zscore", 0.0),
@@ -146,6 +208,7 @@ class FeatureEngine:
             mention_zscore=mention_zscore,
             regime=regime.name.lower(),
             extra=extra,
+            features_by_category=features_by_category,
         )
 
 

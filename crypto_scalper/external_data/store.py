@@ -27,6 +27,16 @@ class NewsStore:
         if len(hist) > self._max_per_symbol:
             del hist[:-self._max_per_symbol]
 
+    @property
+    def ttl_ms(self) -> int:
+        return self._ttl_ms
+
+    def recent_count(self, symbol: str, now_ms: Optional[int] = None) -> int:
+        now = now_ms or int(time.time() * 1000)
+        return sum(
+            1 for e in self._history.get(symbol, []) if now - e.timestamp_ms <= self._ttl_ms
+        )
+
     def latest(self, symbol: str, now_ms: Optional[int] = None) -> Optional[NewsEvent]:
         now = now_ms or int(time.time() * 1000)
         event = self._latest.get(symbol)

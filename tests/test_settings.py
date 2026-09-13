@@ -62,6 +62,51 @@ class TestSettings:
             Settings.load()
 
 
+class TestStrategyConfig:
+    def test_defaults_dev(self, monkeypatch):
+        _clear_env(monkeypatch)
+        monkeypatch.setenv("APP_ENV", "dev")
+        settings = Settings.load()
+        assert settings.strategies.enabled is False
+        assert sum(settings.strategies.signal_weights.values()) == pytest.approx(1.0)
+        assert settings.strategies.long_threshold == 60.0
+        assert settings.strategies.short_threshold == 40.0
+
+    def test_weights_env_override_merged(self, monkeypatch):
+        _clear_env(monkeypatch)
+        monkeypatch.setenv("APP_ENV", "dev")
+        monkeypatch.setenv(
+            "SIGNAL_WEIGHTS_JSON",
+            '{"trend": 0.10, "momentum": 0.30, "volume": 0.15, "order_book": 0.15,'
+            ' "volatility": 0.10, "price_structure": 0.10, "news": 0.05, "ml": 0.05}',
+        )
+        settings = Settings.load()
+        assert settings.strategies.signal_weights["trend"] == 0.10
+        assert settings.strategies.signal_weights["momentum"] == 0.30
+        assert sum(settings.strategies.signal_weights.values()) == pytest.approx(1.0)
+
+    def test_weights_env_partial_rejected(self, monkeypatch):
+        _clear_env(monkeypatch)
+        monkeypatch.setenv("APP_ENV", "dev")
+        monkeypatch.setenv("SIGNAL_WEIGHTS_JSON", '{"trend": 1.0}')
+        with pytest.raises(ConfigurationError):
+            Settings.load()
+
+    def test_allowed_regimes_env(self, monkeypatch):
+        _clear_env(monkeypatch)
+        monkeypatch.setenv("APP_ENV", "dev")
+        monkeypatch.setenv("STRATEGY_ALLOWED_REGIMES", "RANGE,trending_up")
+        settings = Settings.load()
+        assert settings.strategies.allowed_regimes == ("range", "trending_up")
+
+    def test_allowed_regimes_env_unknown(self, monkeypatch):
+        _clear_env(monkeypatch)
+        monkeypatch.setenv("APP_ENV", "dev")
+        monkeypatch.setenv("STRATEGY_ALLOWED_REGIMES", "banana")
+        with pytest.raises(ConfigurationError):
+            Settings.load()
+
+
 class TestRiskConfig:
     def test_defaults_valid(self):
         RiskConfig()
