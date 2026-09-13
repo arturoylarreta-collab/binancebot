@@ -1,0 +1,1 @@
+from crypto_scalper.config.settings import Settings
