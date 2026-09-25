@@ -78,6 +78,7 @@ class WebSocketConfig:
     reconnect_factor: float
     event_queue_maxsize: int
     depth_snapshot_limit: int
+    depth_mode: str = "partial"
 
 
 @dataclass(frozen=True)
@@ -148,7 +149,8 @@ class Settings:
 
         _validate_ws_numbers()
         ws = WebSocketConfig(
-            url=_as_str("BINANCE_FUTURES_WS_URL", "wss://fstream.binance.com/stream"),
+            url=_as_str("BINANCE_FUTURES_WS_URL", "wss://fstream.binance.com"),
+            depth_mode=_as_str("WS_DEPTH_MODE", "partial").lower(),
             batch_size=_as_int("WS_BATCH_SIZE", 20),
             conn_timeout_s=_as_float("WS_CONN_TIMEOUT_S", 30.0),
             ping_interval_s=_as_float("WS_PING_INTERVAL_S", 20.0),

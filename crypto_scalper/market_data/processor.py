@@ -40,7 +40,9 @@ class SymbolProcessor:
         metrics: Metrics,
         depth_snapshot_limit: int = 100,
         resync_retries: int = 3,
+        depth_mode: str = "diff",
     ) -> None:
+        self._depth_mode = depth_mode
         self.symbol = symbol
         self.state = state
         self._rest = rest
@@ -58,7 +60,8 @@ class SymbolProcessor:
         if self._trade_q is None:
             self._trade_q = self._bus.subscribe(f"market.{self.symbol}.trade")
             self._depth_q = self._bus.subscribe(f"market.{self.symbol}.depth")
-        self._resync_event.set()
+        if self._depth_mode != "partial":
+            self._resync_event.set()   # partial streams carry the whole book
 
     async def close(self) -> None:
         if self._trade_q:
@@ -107,7 +110,8 @@ class SymbolProcessor:
                 self._metrics.incr("processor.depth_errors")
                 log.exception("depth apply failed", extra={"symbol": self.symbol})
                 self.state.orderbook.sync_required = True
-            if self.state.orderbook.has_snapshot and self.state.orderbook.sync_required:
+            if (self._depth_mode != "partial" and self.state.orderbook.has_snapshot
+                    and self.state.orderbook.sync_required):
                 self._resync_event.set()
 
     async def _resync_loop(self, stop_event: asyncio.Event) -> None:

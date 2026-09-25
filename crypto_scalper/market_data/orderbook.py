@@ -110,7 +110,21 @@ class OrderBook:
                 break
         return not self.sync_required
 
+    def apply_partial(self, event: DiffDepthEvent) -> None:
+        """Replace the book with a top-N snapshot from a partial-depth stream."""
+        self._bids = {_price_key(p): float(q) for p, q in event.bids if float(q) > 0.0}
+        self._asks = {_price_key(p): float(q) for p, q in event.asks if float(q) > 0.0}
+        self._last_update_id = event.final_update_id
+        self._has_snapshot = bool(self._bids and self._asks)
+        self._first_applied = True
+        self.sync_required = not self._has_snapshot
+        self._last_event_ts_ms = event.event_time_ms
+        self._diff_buffer.clear()
+
     def apply_diff(self, event: DiffDepthEvent) -> None:
+        if getattr(event, "is_snapshot", False):
+            self.apply_partial(event)
+            return
         if not self._has_snapshot:
             self._diff_buffer.append(event)  # bounded deque: oldest drops first
             return

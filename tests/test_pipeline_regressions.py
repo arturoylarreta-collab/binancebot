@@ -90,7 +90,7 @@ def test_streams_are_routed_by_category():
     public = [u for u in by_url if u.endswith("/public/stream")]
     assert market and public
     assert all(s.endswith("@aggTrade") for s in by_url[market[0]])
-    assert all(s.endswith("@depth") for s in by_url[public[0]])
+    assert all("@depth" in s for s in by_url[public[0]])
     assert not any("/stream/" in u or u.endswith("/stream/stream") for u in by_url)
 
 
@@ -131,3 +131,37 @@ def test_secrets_are_redacted_from_final_log_line():
     rec.api_secret = "s3cr3t"
     line = KeyValueFormatter("%(message)s").format(rec)
     assert "AAHdqTcv" not in line and "s3cr3t" not in line
+
+
+async def test_partial_depth_mode_needs_no_rest():
+    """Cloud IPs get REST-banned (418): partial depth streams carry the whole
+    top-N book, so the processor must never call the REST snapshot."""
+    bus = EventBus(queue_maxsize=100)
+    state = SymbolState("BTCUSDT")
+    rest = _FakeRest(100)
+    proc = SymbolProcessor("BTCUSDT", state, rest, bus, Metrics(), depth_mode="partial")
+    stop = asyncio.Event()
+    await proc.start()
+    task = asyncio.create_task(proc.run(stop))
+    try:
+        for bid in (99.0, 98.5):
+            bus.publish_nowait(DepthEvent(topic="market.BTCUSDT.depth", diff=DiffDepthEvent(
+                symbol="BTCUSDT", event_time_ms=5, first_update_id=1, final_update_id=2,
+                previous_final_update_id=0, bids=((bid, 1.0), (97.0, 2.0)),
+                asks=((101.0, 1.0),), is_snapshot=True)))
+        assert await _until(lambda: state.orderbook.is_synced)
+        await asyncio.sleep(0.05)
+        m = state.orderbook.metrics()
+        assert m.best_bid == 98.5 and m.bid_depth == 3.0   # replaced, not merged
+        assert rest.calls == 0
+    finally:
+        stop.set()
+        await task
+        await proc.close()
+
+
+def test_partial_mode_stream_names():
+    import dataclasses
+    cfg = dataclasses.replace(Settings.load().ws, depth_mode="partial")
+    ws = WebSocketManager(cfg, EventBus(), Metrics())
+    assert ws.build_streams(["BTCUSDT"]) == ["btcusdt@aggTrade", "btcusdt@depth20@100ms"]

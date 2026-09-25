@@ -117,7 +117,7 @@ class BinanceFuturesRest:
                     # stop ALL requests for Retry-After instead of digging deeper.
                     retry_after = float(resp.headers.get("Retry-After") or
                                         (30.0 if resp.status == 418 else 5.0))
-                    self._limiter.block_for(min(retry_after, 300.0))
+                    self._limiter.block_for(min(retry_after, 30.0))
                     raise ExchangeRateLimitError(
                         f"rate limited GET {path}: {resp.status} retry_after={retry_after}s")
                 if resp.status == 403:

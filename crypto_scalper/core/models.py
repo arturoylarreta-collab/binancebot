@@ -47,6 +47,9 @@ class DiffDepthEvent:
     bids: Tuple[Tuple[float, float], ...]     # (price, qty)
     asks: Tuple[Tuple[float, float], ...]
     ingest_mono_ms: int = 0
+    # True for partial-depth streams (<sym>@depth20@100ms): bids/asks are the
+    # complete top-N book, not a diff — no REST snapshot / sync protocol needed.
+    is_snapshot: bool = False
 
 
 @dataclass(frozen=True)

@@ -155,7 +155,8 @@ class _MarketData:
         self.states = {s: SymbolState(s) for s in symbols}
         self.processors = [
             SymbolProcessor(symbol=s, state=self.states[s], rest=rest, bus=self.bus,
-                            metrics=METRICS, depth_snapshot_limit=settings.ws.depth_snapshot_limit)
+                            metrics=METRICS, depth_snapshot_limit=settings.ws.depth_snapshot_limit,
+                            depth_mode=settings.ws.depth_mode)
             for s in symbols
         ]
         self.features = FeatureEngine(settings.features, NewsStore(), METRICS, predictor=predictor)
@@ -303,13 +304,36 @@ async def run_paper(settings: Settings, args: argparse.Namespace) -> int:
         # the service as starting even while the universe is resolved.
         runner = await start_server(settings, runtime)
         await rest.start()
+        # Shared cloud IPs are sometimes REST-banned by Binance (HTTP 418):
+        # public metadata falls back to the demo host; market data itself
+        # comes from WebSocket streams, which need no REST at all.
+        demo = BinanceFuturesRest(settings.venue.testnet_rest_url)
+        await demo.start()
         try:
-            offset = await clock.sync_with(rest)
-            log.info("clock synced with exchange", extra={"offset_ms": offset})
-        except Exception as exc:  # noqa: BLE001 - fall back to host clock
-            log.warning("clock sync failed", extra={"error": repr(exc)})
-        symbols = await _resolve_universe(settings, rest)
-        runtime.symbols = list(symbols)
+            for src in (rest, demo):
+                try:
+                    offset = await asyncio.wait_for(clock.sync_with(src), timeout=8)
+                    log.info("clock synced with exchange", extra={"offset_ms": offset})
+                    break
+                except Exception as exc:  # noqa: BLE001 - fall back to host clock
+                    log.warning("clock sync failed", extra={"error": repr(exc)[:160]})
+            symbols = await _resolve_universe(settings, rest)
+            runtime.symbols = list(symbols)
+
+            filters = FilterRegistry()
+            for src in (rest, demo, rest):
+                try:
+                    # Real exchange grid even on paper, so paper sizing == testnet sizing.
+                    info = await asyncio.wait_for(src.exchange_info(), timeout=10)
+                    filters = FilterRegistry.from_exchange_info({"symbols": info}, symbols)
+                    if len(filters):
+                        break
+                except Exception as exc:  # noqa: BLE001 - paper can fall back to defaults
+                    log.warning("exchange filters unavailable", extra={"error": repr(exc)[:160]})
+            if not len(filters):
+                runtime.note("filtros del exchange no disponibles: redondeo por defecto")
+        finally:
+            await demo.close()
 
         if venue == "testnet":
             from crypto_scalper.execution.binance_futures import preflight
@@ -321,20 +345,6 @@ async def run_paper(settings: Settings, args: argparse.Namespace) -> int:
                 runtime.venue = "paper"
             else:
                 runtime.note("testnet preflight OK: API keys válidas")
-
-        filters = FilterRegistry()
-        for attempt in range(4):
-            try:
-                # Real exchange grid even on paper, so paper sizing == testnet sizing.
-                filters = FilterRegistry.from_exchange_info(
-                    {"symbols": await rest.exchange_info()}, symbols)
-                break
-            except Exception as exc:  # noqa: BLE001 - paper can fall back to defaults
-                log.warning("exchange filters unavailable",
-                            extra={"error": repr(exc), "attempt": attempt})
-                await asyncio.sleep(2.0 * (attempt + 1))
-        if not len(filters):
-            runtime.note("filtros del exchange no disponibles: redondeo por defecto")
 
         mirror = await _start_mirror(settings, venue, runtime)
 

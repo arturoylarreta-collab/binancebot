@@ -40,6 +40,9 @@ log = logging.getLogger(__name__)
 class WebSocketManager:
     def __init__(self, config: WebSocketConfig, bus: EventBus, metrics: Metrics) -> None:
         self._config = config
+        # "partial" = <sym>@depth20@100ms (full top-20 book per message, no REST);
+        # "diff" = <sym>@depth (incremental, needs REST snapshots + sync).
+        self.depth_mode = getattr(config, "depth_mode", "diff")
         self._bus = bus
         self._metrics = metrics
         self._url = config.url
@@ -47,14 +50,14 @@ class WebSocketManager:
         self.last_message_mono: float = 0.0
         self.connected: int = 0
 
-    @staticmethod
-    def build_streams(symbols: List[str]) -> List[str]:
-        """aggTrade + raw diff depth stream per (lowercase) symbol."""
+    def build_streams(self, symbols: List[str]) -> List[str]:
+        """aggTrade + depth stream (diff or partial top-20) per symbol."""
+        depth = "depth20@100ms" if self.depth_mode == "partial" else "depth"
         streams = []
         for sym in symbols:
             s = sym.lower()
             streams.append(f"{s}@aggTrade")
-            streams.append(f"{s}@depth")
+            streams.append(f"{s}@{depth}")
         return streams
 
     def _batches(self, streams: List[str]) -> List[List[str]]:
@@ -203,7 +206,7 @@ class WebSocketManager:
                     TradeEvent(topic=SYMBOL_TRADE.format(symbol), trade=event)
                 )
         elif event_type == "depthUpdate":
-            event = _parse_depth_update(payload)
+            event = _parse_depth_update(payload, is_snapshot=self.depth_mode == "partial")
             if event is not None:
                 self._metrics.incr("ws.events.depth")
                 await self._publish_checked(
@@ -250,7 +253,7 @@ def _parse_agg_trade(payload: Dict[str, Any]) -> Optional[AggTrade]:
         return None
 
 
-def _parse_depth_update(payload: Dict[str, Any]) -> Optional[DiffDepthEvent]:
+def _parse_depth_update(payload: Dict[str, Any], is_snapshot: bool = False) -> Optional[DiffDepthEvent]:
     try:
         bids = tuple((float(p), float(q)) for p, q in payload["b"])
         asks = tuple((float(p), float(q)) for p, q in payload["a"])
@@ -263,6 +266,7 @@ def _parse_depth_update(payload: Dict[str, Any]) -> Optional[DiffDepthEvent]:
             bids=bids,
             asks=asks,
             ingest_mono_ms=_mono_ms(),
+            is_snapshot=is_snapshot,
         )
     except (KeyError, TypeError, ValueError):
         return None
