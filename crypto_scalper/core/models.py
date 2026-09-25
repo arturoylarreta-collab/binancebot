@@ -249,6 +249,7 @@ class Fill:
     order_id: str = ""
     fee: float = 0.0
     fee_asset: str = "USDT"
+    trade_id: str = ""        # venue trade id: the only reliable dedupe key
 
 
 @dataclass(frozen=True)

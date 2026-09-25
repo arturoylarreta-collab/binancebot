@@ -131,17 +131,36 @@ class TestMitigations:
     async def test_orphan_order_cancelled(self):
         adapter, om, pm, router = _stack()
         await _open_pm_position(pm, router)
+        # a leftover bot protection whose position no longer exists
         await adapter.submit(OrderRequest(
             symbol=SYMBOL, side="BUY", order_type=OrderType.LIMIT.name,
             quantity=1.0, price=ENTRY - 1000.0,
-            client_order_id="ORPHAN-1",
+            client_order_id="SL-POS-STALE",
             requested_ts_ms=1))
         rec = PeriodicReconciler(pm, om, adapter)
         try:
             report = await rec.reconcile_once()
             assert report.ok is True
             resting = {r.client_order_id for r in await adapter.open_orders()}
-            assert "ORPHAN-1" not in resting
+            assert "SL-POS-STALE" not in resting
+        finally:
+            await rec.close()
+            await pm.close()
+
+    async def test_manual_order_is_never_touched(self):
+        adapter, om, pm, router = _stack()
+        await _open_pm_position(pm, router)
+        await adapter.submit(OrderRequest(
+            symbol=SYMBOL, side="BUY", order_type=OrderType.LIMIT.name,
+            quantity=1.0, price=ENTRY - 1000.0,
+            client_order_id="web_manual_123",
+            requested_ts_ms=1))
+        rec = PeriodicReconciler(pm, om, adapter)
+        try:
+            report = await rec.reconcile_once()
+            assert report.ok is True
+            resting = {r.client_order_id for r in await adapter.open_orders()}
+            assert "web_manual_123" in resting
         finally:
             await rec.close()
             await pm.close()

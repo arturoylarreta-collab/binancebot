@@ -32,6 +32,7 @@ async def test_dashboard_reads_repository_writes(tmp_path):
         "p1", symbol="BTCUSDT", status=PositionStatus.CLOSED,
         entry=100.0, qty=0.1, realized=0.8, close_reason="tp", closed_ts=1000,
     ))
+    await asyncio.sleep(0.01)  # heartbeat is throttled (1 ms); WAL writes are faster
     await obs.save_position(mk_position(
         "p2", symbol="ETHUSDT", status=PositionStatus.ACTIVE,
         entry=50.0, qty=0.2, notional=10.0,

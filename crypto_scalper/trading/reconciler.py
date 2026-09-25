@@ -28,6 +28,7 @@ from crypto_scalper.execution.base import ExchangeAdapter
 from crypto_scalper.execution.order_manager import OrderManager
 from crypto_scalper.execution.position_manager import PositionManager
 from crypto_scalper.execution.reconciliation import (
+    BOT_ORDER_PREFIXES,
     ReconciliationEngine,
     ReconciliationReport,
 )
@@ -38,6 +39,9 @@ log = logging.getLogger(__name__)
 
 _MISSING_PROTECTION = frozenset({"MISSING_STOP", "MISSING_TP"})
 _FATAL_ACTIONABLE = frozenset({"POSITION_MISSING", "QTY_MISMATCH"})
+_TRANSITIONAL = frozenset({
+    PositionStatus.ENTRY_SUBMITTED, PositionStatus.ENTRY_FILLED, PositionStatus.PROTECTING,
+})
 
 
 class PeriodicReconciler:
@@ -50,7 +54,9 @@ class PeriodicReconciler:
         interval_s: float = 60.0,
         repository: Optional[Repository] = None,
         set_paused: Optional[Callable[[str], None]] = None,
+        managed_symbols: Optional[set] = None,
     ) -> None:
+        self._managed_symbols = {s.upper() for s in managed_symbols} if managed_symbols else None
         self._pm = position_manager
         self._om = order_manager
         self._adapter = adapter
@@ -93,6 +99,15 @@ class PeriodicReconciler:
 
     async def reconcile_once(self) -> ReconciliationReport:
         """Reconcile, mitigate actionable drift, re-check and persist."""
+        if self._busy_symbols():
+            # A position is mid-open (entry/protection in flight): venue and
+            # book legitimately disagree for a moment. Check again next pass.
+            METRICS.incr("paper.reconcile_deferred")
+            report = await self._engine.reconcile(self._pm, self._om, self._adapter)
+            busy = self._busy_symbols()
+            report = type(report)(tuple(i for i in report.issues if i.symbol not in busy))
+            self._last_report = report
+            return report
         report = await self._engine.reconcile(self._pm, self._om, self._adapter)
         self._reconcile_count += 1
         if not report.ok:
@@ -118,9 +133,23 @@ class PeriodicReconciler:
 
     # ── internals ────────────────────────────────────────────────────────────
 
+    def _busy_symbols(self) -> set:
+        return {p.symbol for p in self._pm.positions() if p.status in _TRANSITIONAL}
+
+    def _is_ours(self, client_order_id: str, symbol: str) -> bool:
+        if self._managed_symbols is not None and symbol.upper() not in self._managed_symbols:
+            return False
+        return client_order_id.startswith(BOT_ORDER_PREFIXES)
+
     async def _run(self) -> None:
-        # First pass immediately, then on the configured cadence.
-        await self.reconcile_once()
+        # First pass immediately, then on the configured cadence. A failing
+        # pass (network, venue hiccup) must never kill the patrol.
+        try:
+            await self.reconcile_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            log.exception("initial reconciliation failed")
         while not self._stop.is_set():
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self._interval_s)
@@ -157,12 +186,15 @@ class PeriodicReconciler:
 
     async def _cancel_orphans(self) -> None:
         tracked = set()
-        for pos in self._pm.positions():
+        for pos in self._pm.open_positions():
             if pos.stop_client_order_id:
                 tracked.add(pos.stop_client_order_id)
             if pos.take_profit_client_order_id:
                 tracked.add(pos.take_profit_client_order_id)
+        busy = self._busy_symbols()
         for report in await self._adapter.open_orders():
+            if report.symbol in busy or not self._is_ours(report.client_order_id, report.symbol):
+                continue
             if report.client_order_id not in tracked:
                 try:
                     await self._adapter.cancel(report.symbol, report.client_order_id)
@@ -172,11 +204,14 @@ class PeriodicReconciler:
                                 extra={"client_order_id": report.client_order_id})
 
     async def _flatten_untracked(self) -> None:
-        internal = {p.symbol for p in self._pm.open_positions()}
+        internal = {p.symbol for p in self._pm.positions()
+                    if p.status in _TRANSITIONAL or p.status is PositionStatus.ACTIVE}
         for venue_pos in await self._adapter.open_positions():
             symbol = venue_pos["symbol"]
             if symbol in internal:
                 continue
+            if self._managed_symbols is not None and symbol not in self._managed_symbols:
+                continue  # not ours to flatten
             qty = float(venue_pos["quantity"])
             side = Side.SELL.name if venue_pos["side"] == "LONG" else Side.BUY.name
             try:
