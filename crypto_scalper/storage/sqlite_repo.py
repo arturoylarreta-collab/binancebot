@@ -141,9 +141,17 @@ class SqliteRepository(Repository):
         if self._db_path != Path(":memory:"):
             self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(str(self._db_path))
+        # check_same_thread=False: writes may be offloaded to a worker thread;
+        # the lock serializes every access to the single connection.
+        self._conn = sqlite3.connect(str(self._db_path), timeout=10.0,
+                                     check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
+            if self._db_path != Path(":memory:"):
+                # WAL: the dashboard reads concurrently without blocking writes.
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._conn.execute("PRAGMA busy_timeout=10000")
             self._conn.executescript(_SCHEMA)
             self._migrate()
             self._conn.commit()
@@ -154,6 +162,34 @@ class SqliteRepository(Repository):
     def _migrate(self) -> None:
         """Idempotent additive migrations: never break databases from FASE 8."""
         self._ensure_column("positions", "pnl_unrealized", "REAL NOT NULL DEFAULT 0")
+        self._ensure_column("positions", "fees", "REAL NOT NULL DEFAULT 0")
+        self._ensure_column("positions", "exit_price", "REAL NOT NULL DEFAULT 0")
+        self._ensure_column("fills", "trade_id", "TEXT NOT NULL DEFAULT ''")
+        for ddl in (
+            "CREATE INDEX IF NOT EXISTS ix_positions_status ON positions(status)",
+            "CREATE INDEX IF NOT EXISTS ix_positions_closed ON positions(closed_ts_ms)",
+            "CREATE INDEX IF NOT EXISTS ix_signals_ts ON signals(ts_ms)",
+            "CREATE INDEX IF NOT EXISTS ix_heartbeats_ts ON heartbeats(ts_ms)",
+            "CREATE INDEX IF NOT EXISTS ix_risk_ts ON risk_decisions(ts_ms)",
+            "CREATE INDEX IF NOT EXISTS ix_fills_order ON fills(order_id)",
+        ):
+            self._conn.execute(ddl)
+
+    def prune(self, *, signals_days: float = 3.0, heartbeats_days: float = 30.0,
+              events_days: float = 7.0) -> Dict[str, int]:
+        """Retention for 24/7 sessions: high-volume audit tables are bounded."""
+        now = _now_ms()
+        day = 86_400_000
+        out: Dict[str, int] = {}
+        with self._lock:
+            for table, days in (("signals", signals_days), ("heartbeats", heartbeats_days),
+                                ("events", events_days), ("risk_decisions", signals_days),
+                                ("reconciliations", heartbeats_days)):
+                cur = self._conn.execute(f"DELETE FROM {table} WHERE ts_ms < ?",
+                                         (now - int(days * day),))
+                out[table] = cur.rowcount
+            self._conn.commit()
+        return out
 
     def _ensure_column(self, table: str, column: str, decl: str) -> None:
         existing = {
@@ -202,8 +238,8 @@ class SqliteRepository(Repository):
                     entry_client_order_id, stop_client_order_id,
                     take_profit_client_order_id, entry_order_id,
                     opened_ts_ms, closed_ts_ms, realized_pnl, close_reason,
-                    pnl_unrealized
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    pnl_unrealized, fees, exit_price
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 _position_row(position, pnl_unrealized),
             )
@@ -228,7 +264,9 @@ class SqliteRepository(Repository):
             return
         rows = []
         for fill in fills:
-            key = (fill.order_id, fill.ts_ms, fill.quantity, fill.price, fill.side)
+            trade_id = getattr(fill, "trade_id", "")
+            key = ((fill.order_id, trade_id) if trade_id
+                   else (fill.order_id, fill.ts_ms, fill.quantity, fill.price, fill.side))
             if key in self._seen_fills:
                 continue
             self._seen_fills.add(key)
@@ -240,8 +278,8 @@ class SqliteRepository(Repository):
                 """
                 INSERT INTO fills (
                     symbol, client_order_id, side, quantity, price,
-                    ts_ms, order_id, fee, fee_asset
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ts_ms, order_id, fee, fee_asset, trade_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
@@ -371,6 +409,8 @@ def _position_row(
         position.realized_pnl,
         position.close_reason,
         float(pnl_unrealized if pnl_unrealized is not None else 0.0),
+        float(getattr(position, "fees", 0.0)),
+        float(getattr(position, "exit_price", 0.0)),
     )
 
 
@@ -412,6 +452,8 @@ def _position_from_row(r: Dict[str, Any]) -> ManagedPosition:
         closed_ts_ms=int(r["closed_ts_ms"]),
         realized_pnl=float(r["realized_pnl"]),
         close_reason=r["close_reason"],
+        fees=float(r["fees"]) if "fees" in r.keys() else 0.0,
+        exit_price=float(r["exit_price"]) if "exit_price" in r.keys() else 0.0,
     )
 
 
@@ -461,4 +503,5 @@ def _fill_row(fill: Fill) -> Tuple[Any, ...]:
         fill.order_id,
         fill.fee,
         fill.fee_asset,
+        getattr(fill, "trade_id", ""),
     )

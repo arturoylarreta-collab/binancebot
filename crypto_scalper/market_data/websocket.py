@@ -40,36 +40,64 @@ log = logging.getLogger(__name__)
 class WebSocketManager:
     def __init__(self, config: WebSocketConfig, bus: EventBus, metrics: Metrics) -> None:
         self._config = config
+        # "partial" = <sym>@depth20@100ms (full top-20 book per message, no REST);
+        # "diff" = <sym>@depth (incremental, needs REST snapshots + sync).
+        self.depth_mode = getattr(config, "depth_mode", "diff")
         self._bus = bus
         self._metrics = metrics
         self._url = config.url
         self._tasks: List[asyncio.Task] = []
+        self.last_message_mono: float = 0.0
+        self.connected: int = 0
 
-    @staticmethod
-    def build_streams(symbols: List[str]) -> List[str]:
-        """aggTrade + raw diff depth stream per (lowercase) symbol."""
+    def build_streams(self, symbols: List[str]) -> List[str]:
+        """aggTrade + depth stream (diff or partial top-20) per symbol."""
+        depth = "depth20@100ms" if self.depth_mode == "partial" else "depth"
         streams = []
         for sym in symbols:
             s = sym.lower()
             streams.append(f"{s}@aggTrade")
-            streams.append(f"{s}@depth")
+            streams.append(f"{s}@{depth}")
         return streams
 
     def _batches(self, streams: List[str]) -> List[List[str]]:
         size = self._config.batch_size
         return [streams[i : i + size] for i in range(0, len(streams), size)]
 
+    def routed_batches(self, symbols: List[str]) -> List[Tuple[str, List[str]]]:
+        """(url, streams) per physical connection.
+
+        Binance routes USD-M market streams by category: ``@aggTrade`` is only
+        delivered on ``/market`` and ``@depth`` on ``/public`` (a legacy
+        ``/stream`` connection silently receives depth only).
+        """
+        base = self._url.rstrip("/")
+        for suffix in ("/stream", "/ws"):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+        for suffix in ("/public", "/market"):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+        trades = [s for s in self.build_streams(symbols) if s.endswith("@aggTrade")]
+        depth = [s for s in self.build_streams(symbols) if not s.endswith("@aggTrade")]
+        out: List[Tuple[str, List[str]]] = []
+        for batch in self._batches(trades):
+            out.append((f"{base}/market/stream", batch))
+        for batch in self._batches(depth):
+            out.append((f"{base}/public/stream", batch))
+        return out
+
     async def run(self, symbols: List[str], stop_event: asyncio.Event) -> None:
         """Keep all connection tasks alive in parallel until stop is set."""
-        streams = self.build_streams(symbols)
-        batches = self._batches(streams)
-        log.info("ws manager starting", extra={"streams": len(streams), "connections": len(batches)})
-        self._metrics.set_gauge("ws.streams", len(streams))
+        batches = self.routed_batches(symbols)
+        n_streams = sum(len(b) for _, b in batches)
+        log.info("ws manager starting", extra={"streams": n_streams, "connections": len(batches)})
+        self._metrics.set_gauge("ws.streams", n_streams)
         self._metrics.set_gauge("ws.connections.target", len(batches))
 
         tasks = [
-            asyncio.create_task(self._run_connection(batch, idx))
-            for idx, batch in enumerate(batches)
+            asyncio.create_task(self._run_connection(batch, idx, url))
+            for idx, (url, batch) in enumerate(batches)
         ]
         self._tasks = tasks
         try:
@@ -77,12 +105,15 @@ class WebSocketManager:
         finally:
             for t in tasks:
                 t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _run_connection(self, streams: List[str], idx: int) -> None:
+    async def _run_connection(self, streams: List[str], idx: int, url: str = "") -> None:
         attempt = 0
+        loop = asyncio.get_running_loop()
         while True:
+            started = loop.time()
             try:
-                await self._connect_and_read(streams, idx)
+                await self._connect_and_read(streams, idx, url or self._url)
             except asyncio.CancelledError:
                 return
             except Exception as exc:  # noqa: BLE001 - reconnector must survive any failure
@@ -94,6 +125,10 @@ class WebSocketManager:
                 self._metrics.incr("ws.disconnects")
 
             self._metrics.incr("ws.reconnects")
+            # A connection that lived long enough was healthy: Binance closes
+            # every stream after 24h, which must not escalate the backoff.
+            if loop.time() - started > 60.0:
+                attempt = 0
             delay = self._backoff_delay(attempt)
             attempt += 1
             self._metrics.set_gauge("ws.backoff_s", delay)
@@ -107,20 +142,22 @@ class WebSocketManager:
         jitter = random.uniform(0, min(0.5, delay * 0.2))
         return delay + jitter
 
-    async def _connect_and_read(self, streams: List[str], idx: int) -> None:
+    async def _connect_and_read(self, streams: List[str], idx: int, base_url: str = "") -> None:
         query = "/".join(streams)
-        url = f"{self._url}?streams={query}"
+        url = f"{base_url or self._url}?streams={query}"
         timeout = aiohttp.ClientTimeout(total=self._config.conn_timeout_s)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.ws_connect(url, autoping=True) as ws:
                 log.info("ws connected", extra={"conn": idx})
                 self._metrics.incr("ws.connections.active")
+                self.connected += 1
                 await self._bus.publish(
                     LifecycleEvent(topic=LIFECYCLE, kind="ws.connected", detail={"conn": idx})
                 )
                 try:
                     await self._read_loop(ws, idx)
                 finally:
+                    self.connected -= 1
                     self._metrics.decr("ws.connections.active")
 
     async def _read_loop(self, ws: aiohttp.ClientWebSocketResponse, idx: int) -> None:
@@ -135,12 +172,8 @@ class WebSocketManager:
                 raise exc
 
             if msg.type == aiohttp.WSMsgType.TEXT:
-                text = msg.data
-                if text in ("ping", '{"e":"ping"}'):
-                    await ws.send_str("pong")
-                    self._metrics.incr("ws.pong_sent")
-                    continue
-                await self._handle_frame(text, idx, ws)
+                self.last_message_mono = asyncio.get_running_loop().time()
+                await self._handle_frame(msg.data, idx, ws)
             elif msg.type == aiohttp.WSMsgType.PING:
                 await ws.pong(msg.data)
             elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
@@ -173,7 +206,7 @@ class WebSocketManager:
                     TradeEvent(topic=SYMBOL_TRADE.format(symbol), trade=event)
                 )
         elif event_type == "depthUpdate":
-            event = _parse_depth_update(payload)
+            event = _parse_depth_update(payload, is_snapshot=self.depth_mode == "partial")
             if event is not None:
                 self._metrics.incr("ws.events.depth")
                 await self._publish_checked(
@@ -191,14 +224,9 @@ class WebSocketManager:
             # A bounded consumer queue overflowed: signal a resync for that
             # symbol instead of blocking the WebSocket receive loop.
             self._metrics.incr("ws.queue_overflow")
-            log.error("ws queue overflow", extra={"topic": event.topic})
-            await self._bus.publish_nowait(
-                LifecycleEvent(
-                    topic=LIFECYCLE,
-                    kind="queue.overflow",
-                    symbol=event.topic.rsplit(".", 1)[-1],
-                )
-            )
+            log.warning("ws queue overflow; event dropped", extra={"topic": event.topic})
+            # Depth gaps are caught by the pu-continuity check, which triggers a
+            # REST resync; dropped trades only degrade one feature window.
 
 
 class ExchangeStalled(Exception):
@@ -225,7 +253,7 @@ def _parse_agg_trade(payload: Dict[str, Any]) -> Optional[AggTrade]:
         return None
 
 
-def _parse_depth_update(payload: Dict[str, Any]) -> Optional[DiffDepthEvent]:
+def _parse_depth_update(payload: Dict[str, Any], is_snapshot: bool = False) -> Optional[DiffDepthEvent]:
     try:
         bids = tuple((float(p), float(q)) for p, q in payload["b"])
         asks = tuple((float(p), float(q)) for p, q in payload["a"])
@@ -238,6 +266,7 @@ def _parse_depth_update(payload: Dict[str, Any]) -> Optional[DiffDepthEvent]:
             bids=bids,
             asks=asks,
             ingest_mono_ms=_mono_ms(),
+            is_snapshot=is_snapshot,
         )
     except (KeyError, TypeError, ValueError):
         return None

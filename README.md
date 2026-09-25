@@ -1,24 +1,21 @@
 # crypto_scalper — quantitative, async, modular crypto scalping system
 
-Status: **FASE 1 (arquitectura/riesgo) + FASE 2 (ingesta de datos) + FASE 3 (motor de features y señales) + FASE 4 (filtro ML) + FASE 5 (Risk Engine) + FASE 6 (Execution Engine offline) + FASE 7 (Paper Trading offline) implementadas.**
+Status: **FASES 1-8.5 + FASE 9 (auditoría, adapter Binance Futures Testnet, operación 24/7 y dashboard web embebido).** Ver [`HANDOFF_FASE9.md`](HANDOFF_FASE9.md) para la auditoría completa.
 
-FASE 2-4 producen un `FeatureSnapshot` estructurado por activo con features por
-categoría, un `Signal` Score 0-100 con desglose por dimensión y una dimensión
-`ml` alimentada por un clasificador probabilístico ensayado offline con walk-forward
-validation. La **FASE 5 añade el Risk Engine**: autoridad final sobre cada Signal
-(aprueba o rechaza por límites duros de riesgo, position sizing por riesgo y SL/TP
-obligatorios), sin red y determinista. La **FASE 6 añade el Execution Engine offline**:
-única capa que ejecuta un `RiskDecision` APPROVED con `ExchangeAdapter` +
-`SimulatedExecutionAdapter`, `OrderManager`, `PositionManager` (secuencia obligatoria
-Entry → Fill → Protección → Active, nunca activa sin SL+TP resting), `ExecutionRouter`
-(el riesgo manda: solo APPROVED llega al venus) y `ReconciliationEngine`. La **FASE 7
-añade el Paper Trading offline**: `TradeOrchestrator` (ciclo señal→riesgo→ejecución con
-equity mark-to-market de `PaperAccount`, guard por símbolo y pausa ante errores Fatales),
-persistencia SQLite idempotente del audit trail (`SqliteRepository`), `PeriodicReconciler`
-que mitiga la deriva venue-interno (cierra posiciones desprotegidas, cancela huérfanas,
-aplana no-trackeadas) y `PaperTradingEngine` + `--mode paper` para simular sesiones.
-Es 100% simulado e idempotente: **no hay conexión real ni órdenes reales** (eso es una
-fase posterior con un adapter LIVE).
+**Arranque rápido**
+
+```powershell
+pip install -r requirements-dev.txt
+python -m pytest -q                                    # 433 tests, sin red
+python -m crypto_scalper.main --mode paper --symbols BTCUSDT,ETHUSDT,SOLUSDT
+# → dashboard en http://localhost:8080/  ·  salud en /healthz
+```
+
+- `EXECUTION_VENUE=paper` (default): datos de mercado reales + ejecución simulada.
+- `EXECUTION_VENUE=testnet` + `BINANCE_TESTNET_API_KEY/SECRET`: **órdenes reales en la
+  cuenta demo** de Binance Futures (SL/TP vía Algo Service). El dinero real no es
+  seleccionable.
+- Despliegue 24/7: `Dockerfile` + `render.yaml` (Render, Frankfurt, disco persistente).
 
 ---
 
@@ -208,12 +205,12 @@ El modo paper construye el pipeline real (WebSocket → Features → Signal), ej
 `on_price`/`on_signal` contra el `SimulatedExecutionAdapter`, reconcilia en
 cadencia y deja el audit trail en el SQLite de `PAPER_DB_PATH` (`logs/paper.db`).
 
-6) **Alertas Telegram + dashboard** (FASE 8.5 — en tu `.env` local, gitignored):
+6) **Alertas Telegram + dashboard** (en tu `.env` local, gitignored):
 
 ```powershell
 # .env: token/chat de tu bot (BotFather) + MONITORING_TELEGRAM_ENABLED=true
 python -m crypto_scalper.main --mode paper --symbols BTCUSDT
-streamlit run crypto_scalper/dashboard/app.py   # lee logs/paper.db (DASHBOARD_DB_PATH)
+# el dashboard lo sirve el propio bot: http://localhost:8080/
 ```
 
 El `TelegramNotifier` es fire-and-forget (nunca bloquea el ciclo de ejecución); si
@@ -248,7 +245,7 @@ equity/drawdown/exposición, posiciones abiertas, señales recientes y métricas
 | Audit trail (FASE 7) | SQLite en `logs/paper.db` (`PAPER_DB_PATH`) |
 | Alertas Telegram (FASE 8.5) | `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` + `MONITORING_TELEGRAM_ENABLED` (false por defecto) |
 | Cadencia heartbeat (FASE 8.5) | 5 s (`MONITORING_HEARTBEAT_INTERVAL_S`) · cola 256 · cooldown halt 300 s |
-| Dashboard (FASE 8.5) | `streamlit run crypto_scalper/dashboard/app.py` · DB `DASHBOARD_DB_PATH`=`logs/paper.db` |
+| Dashboard (FASE 9) | embebido en el bot: `http://localhost:$PORT/` · API `/api/*` · salud `/healthz` |
 | Lote WS | 20 streams/conexión |
 | Snapshot depth | 100 niveles/símbolo |
 | Feature interval | 1 s |

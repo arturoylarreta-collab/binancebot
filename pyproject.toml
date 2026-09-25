@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crypto-scalper"
-version = "0.8.1"
-description = "Modular, quantitative, async crypto scalping research system (FASE 1/2: architecture + market data, FASE 3: signals, FASE 4: ML filter, FASE 5: Risk Engine, FASE 6: Execution Engine, FASE 7: Paper Trading offline, FASE 8: Backtesting, FASE 8.5: Observability + Telegram alerts + Dashboard)"
+version = "0.9.0"
+description = "Modular, quantitative, async crypto scalping system: real-time market data, signals, ML filter, risk engine, idempotent execution (paper simulator or Binance USD-M Futures testnet), backtesting, and an embedded live dashboard"
 requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.26",
@@ -13,7 +13,8 @@ dependencies = [
     "python-dotenv>=1.0",
     "scikit-learn>=1.9",
     "joblib>=1.3",
-    "streamlit>=1.57",
+    "google-auth>=2.30",
+    "requests>=2.31",
 ]
 
 [project.optional-dependencies]
@@ -22,8 +23,14 @@ dev = [
     "pytest-asyncio>=0.23",
 ]
 
+[project.scripts]
+crypto-scalper = "crypto_scalper.main:main"
+
 [tool.setuptools.packages.find]
 include = ["crypto_scalper*"]
+
+[tool.setuptools.package-data]
+"crypto_scalper.dashboard" = ["static/*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

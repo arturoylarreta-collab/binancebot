@@ -47,6 +47,9 @@ class DiffDepthEvent:
     bids: Tuple[Tuple[float, float], ...]     # (price, qty)
     asks: Tuple[Tuple[float, float], ...]
     ingest_mono_ms: int = 0
+    # True for partial-depth streams (<sym>@depth20@100ms): bids/asks are the
+    # complete top-N book, not a diff — no REST snapshot / sync protocol needed.
+    is_snapshot: bool = False
 
 
 @dataclass(frozen=True)
@@ -249,6 +252,7 @@ class Fill:
     order_id: str = ""
     fee: float = 0.0
     fee_asset: str = "USDT"
+    trade_id: str = ""        # venue trade id: the only reliable dedupe key
 
 
 @dataclass(frozen=True)
@@ -319,6 +323,8 @@ class ManagedPosition:
     closed_ts_ms: int = 0
     realized_pnl: float = 0.0
     close_reason: str = ""
+    fees: float = 0.0              # entry + exit commissions (actual or estimated)
+    exit_price: float = 0.0
 
 
 # ── Risk ───────────────────────────────────────────────────────────────────────

@@ -14,6 +14,7 @@ from crypto_scalper.core.enums import OrderStatus, OrderType
 from crypto_scalper.core.exceptions import (
     InvalidOrderError,
     OrderRejectedError,
+    ExchangeConnectionError,
     OrderTimeoutError,
 )
 from crypto_scalper.core.models import OrderRequest
@@ -44,7 +45,7 @@ class _FlakyAdapter(SimulatedExecutionAdapter):
     async def submit(self, request: OrderRequest):
         if self._submits < self._failures:
             self._submits += 1
-            raise OrderRejectedError("flaky venue")
+            raise ExchangeConnectionError("flaky venue")
         self._submits += 1
         return await super().submit(request)
 
@@ -114,7 +115,7 @@ class TestIdempotency:
     async def test_failed_submit_not_remembered(self):
         adapter = _FlakyAdapter(failures=10)
         om = OrderManager(adapter, ExecutionConfig(retries=1, backoff_base_s=0.01))
-        with pytest.raises(OrderRejectedError):
+        with pytest.raises(ExchangeConnectionError):
             await om.submit(_req(cid="fail"))
         assert om.get_order("fail") is None  # can be retried later
 
@@ -136,7 +137,7 @@ class TestRetry:
     async def test_retries_exhausted_raise(self):
         adapter = _flaky_adapter(failures=5)
         om = OrderManager(adapter, ExecutionConfig(retries=1, backoff_base_s=0.005))
-        with pytest.raises(OrderRejectedError):
+        with pytest.raises(ExchangeConnectionError):
             await om.submit(_req(cid="r2"))
 
 
@@ -192,3 +193,38 @@ class TestCancel:
         assert (await om.cancel(SYMBOL, "old")).status == OrderStatus.CANCELED.name
         assert new.status == OrderStatus.NEW.name
         assert om.get_order("new") is not None
+
+class TestRetrySafety:
+    async def test_rejection_is_never_retried(self):
+        class _Rejecting(SimulatedExecutionAdapter):
+            calls = 0
+
+            async def submit(self, request):
+                type(self).calls += 1
+                raise OrderRejectedError("insufficient margin")
+
+        om = OrderManager(_Rejecting(), ExecutionConfig(retries=3, backoff_base_s=0.0))
+        with pytest.raises(OrderRejectedError):
+            await om.submit(OrderRequest(symbol="BTCUSDT", side="BUY", order_type="MARKET",
+                                         quantity=1.0, client_order_id="rej-1"))
+        assert _Rejecting.calls == 1
+
+    async def test_transient_error_after_venue_accept_does_not_double_submit(self):
+        """Binance accepts a repeated client id once the first order is FILLED:
+        the manager must look the order up before re-submitting."""
+
+        class _AckLost(SimulatedExecutionAdapter):
+            submits = 0
+
+            async def submit(self, request):
+                type(self).submits += 1
+                await super().submit(request)
+                raise ExchangeConnectionError("ack lost after accept")
+
+        venue = _AckLost()
+        venue.set_price("BTCUSDT", 100.0)
+        om = OrderManager(venue, ExecutionConfig(retries=3, backoff_base_s=0.0))
+        report = await om.submit(OrderRequest(symbol="BTCUSDT", side="BUY", order_type="MARKET",
+                                              quantity=1.0, client_order_id="ack-1"))
+        assert _AckLost.submits == 1
+        assert report.status == OrderStatus.FILLED.name

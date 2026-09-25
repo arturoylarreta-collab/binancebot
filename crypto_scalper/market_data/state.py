@@ -7,6 +7,8 @@ trade buckets, candles, and freshness bookkeeping.
 from __future__ import annotations
 
 import time
+
+from crypto_scalper.core import clock
 from typing import Optional
 
 from crypto_scalper.core.models import AggTrade, DiffDepthEvent
@@ -48,10 +50,16 @@ class SymbolState:
 
     def is_ready(self) -> bool:
         return (
-            self.orderbook.has_snapshot
+            self.orderbook.is_synced
+            and not self.suspended
             and self.latest_price is not None
             and self.candles.count >= 2
         )
 
+    def data_age_ms(self, now_ms: int) -> int:
+        """Age of the freshest market event (trade or depth); large when unknown."""
+        latest = max(self.last_trade_ts_ms, self.last_ob_ts_ms)
+        return now_ms - latest if latest > 0 else 10**9
+
     def utc_now_ms(self) -> int:
-        return int(time.time() * 1000)
+        return clock.now_ms()

@@ -50,7 +50,8 @@ class MarketRegime:
                 return Regime.TRENDING_UP
             if ema9 < ema21 < ema50:
                 return Regime.TRENDING_DOWN
-            return Regime.TRENDING_UP  # momentum with flat stack
+            # strong ADX without a clean stack: follow the fast-vs-slow EMA sign
+            return Regime.TRENDING_UP if ema9 >= ema50 else Regime.TRENDING_DOWN
 
         if adx < self._t.adx_range:
             if atr_pct >= self._t.atr_pct_high:

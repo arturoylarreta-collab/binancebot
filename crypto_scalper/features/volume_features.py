@@ -28,7 +28,8 @@ def volume_features(aggregator: TradeAggregator, now_ms: int, window_s: int = 60
         "avg_trade_size_30s": stats_30.avg_trade_size,
         "aggressive_volume_30s": aggressive,
         "buy_ratio_30s": stats_30.buy_ratio,
-        "volume_burst_5s_ratio": stats_5.volume / stats_5_vol,
+        # 5s volume vs the average 5s slice of the last 60s (1.0 = normal pace)
+        "volume_burst_5s_ratio": stats_5.volume / max(vm["volume"] / 12.0, 1e-12),
         "volume_divergence": _divergence(vm["volume"], vm["volume_acceleration"]),
     }
 

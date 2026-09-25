@@ -23,6 +23,7 @@ import json
 import logging
 import signal
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
@@ -38,6 +39,7 @@ from crypto_scalper.backtest.data import (
 from crypto_scalper.backtest.engine import BacktestEngine
 from crypto_scalper.config.settings import Settings
 from crypto_scalper.config.symbols import SymbolRules
+from crypto_scalper.core import clock
 from crypto_scalper.core.events import EventBus
 from crypto_scalper.core.exceptions import (
     ExchangeConnectionError,
@@ -85,6 +87,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="backtest: start YYYY-MM-DD[ HH:MM:SS] (UTC) of historical window")
     p.add_argument("--end", default="",
                    help="backtest: end YYYY-MM-DD[ HH:MM:SS] (UTC) of historical window")
+    p.add_argument("--venue", default=None, choices=["paper", "testnet"],
+                   help="paper mode execution venue (default: EXECUTION_VENUE)")
     return p.parse_args(argv)
 
 
@@ -97,7 +101,8 @@ async def run(args: argparse.Namespace) -> int:
     if args.symbols:
         settings = _override_symbols(settings, args.symbols)
     log_dir = Path(args.log_dir) if args.log_dir else settings.log_dir
-    setup_logging(level=settings.log_level, log_dir=log_dir)
+    setup_logging(level=settings.log_level, log_dir=log_dir,
+                  fmt=settings.log_format, enable_file=_as_bool_env("LOG_TO_FILE", True))
     log.info("starting", extra={"env": settings.environment.name, "mode": settings.run_mode})
 
     if settings.run_mode == "live":
@@ -119,10 +124,99 @@ async def run(args: argparse.Namespace) -> int:
     return await run_pipeline(settings)
 
 
+def _as_bool_env(name: str, default: bool) -> bool:
+    import os
+    raw = os.environ.get(name, "")
+    return default if raw == "" else raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 def _override_symbols(settings: Settings, raw: str) -> Settings:
     symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
     import dataclasses
     return dataclasses.replace(settings, explicit_symbols=symbols)
+
+
+# ── Shared live data plane ────────────────────────────────────────────────────
+
+
+class _MarketData:
+    """WebSocket → processors → SymbolState → FeatureEngine → snapshot queue.
+
+    Start order matters: the WebSocket streams first so depth diffs buffer
+    while each processor takes its REST snapshot (Binance sync protocol).
+    """
+
+    def __init__(self, settings: Settings, rest: BinanceFuturesRest, symbols: List[str],
+                 stop_event: asyncio.Event, predictor=None) -> None:
+        self.settings = settings
+        self.symbols = symbols
+        self.stop_event = stop_event
+        self.bus = EventBus(queue_maxsize=max(1000, settings.ws.event_queue_maxsize // 10))
+        self.states = {s: SymbolState(s) for s in symbols}
+        self.processors = [
+            SymbolProcessor(symbol=s, state=self.states[s], rest=rest, bus=self.bus,
+                            metrics=METRICS, depth_snapshot_limit=settings.ws.depth_snapshot_limit,
+                            depth_mode=settings.ws.depth_mode)
+            for s in symbols
+        ]
+        self.features = FeatureEngine(settings.features, NewsStore(), METRICS, predictor=predictor)
+        self.out: asyncio.Queue = asyncio.Queue(maxsize=max(100, 20 * len(symbols)))
+        self.ws = WebSocketManager(settings.ws, self.bus, METRICS)
+        self.tasks: List[asyncio.Task] = []
+
+    def latest_price(self, symbol: str) -> Optional[float]:
+        st = self.states.get(symbol)
+        return st.latest_price if st is not None else None
+
+    async def start(self) -> None:
+        for proc in self.processors:
+            await proc.start()           # subscribe only (no snapshot yet)
+        self.tasks.append(asyncio.create_task(self.ws.run(self.symbols, self.stop_event), name="ws"))
+        await asyncio.sleep(1.0)         # let the diff stream start buffering
+        for proc in self.processors:
+            self.tasks.append(asyncio.create_task(proc.run(self.stop_event), name=f"proc-{proc.symbol}"))
+        for sym in self.symbols:
+            self.tasks.append(asyncio.create_task(
+                _feature_worker(self.states[sym], self.features, self.out, self.stop_event,
+                                self.settings.features.interval_s),
+                name=f"features-{sym}"))
+
+    async def close(self) -> None:
+        for t in self.tasks:
+            t.cancel()
+        await asyncio.gather(*self.tasks, return_exceptions=True)
+        for proc in self.processors:
+            await proc.close()
+
+
+async def _supervise(tasks: dict, stop_event: asyncio.Event) -> int:
+    """Wait until stop is requested or ANY critical task ends.
+
+    A critical task ending on its own is a failure: return non-zero so the
+    platform (Render/Docker restart policy) restarts the process instead of
+    leaving a zombie that serves a healthy-looking dashboard.
+    """
+    stop_task = asyncio.create_task(stop_event.wait(), name="stop")
+    waiting = set(tasks.values()) | {stop_task}
+    done, _ = await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
+    rc = 0
+    for t in done:
+        if t is stop_task:
+            continue
+        name = next((k for k, v in tasks.items() if v is t), t.get_name())
+        if t.cancelled():
+            log.error("critical task cancelled", extra={"task": name})
+            rc = 1
+        elif t.exception() is not None:
+            log.critical("critical task crashed", extra={"task": name},
+                         exc_info=t.exception())
+            rc = 1
+        else:
+            log.warning("critical task finished", extra={"task": name})
+            rc = rc or (0 if name == "engine" else 1)
+    stop_event.set()
+    stop_task.cancel()
+    return rc
 
 
 # ── Full pipeline ───────────────────────────────────────────────────────────────
@@ -130,179 +224,303 @@ def _override_symbols(settings: Settings, raw: str) -> Settings:
 
 async def run_pipeline(settings: Settings) -> int:
     rest = BinanceFuturesRest(settings.rest_url)
-    bus = EventBus(queue_maxsize=settings.ws.event_queue_maxsize // 10)
-    news_store = NewsStore()
     repo: Repository = NoopRepository()
     stop_event = asyncio.Event()
     _install_signal_handlers(stop_event)
-
-    states: dict = {}
-    processors: List[SymbolProcessor] = []
-    workers: List[asyncio.Task] = []
-    sink: Optional[asyncio.Task] = None
-    metrics_task: Optional[asyncio.Task] = None
-    ws_task: Optional[asyncio.Task] = None
-
+    md: Optional[_MarketData] = None
+    extra: List[asyncio.Task] = []
     try:
         await rest.start()
         symbols = await _resolve_universe(settings, rest)
-
-        states = {s: SymbolState(s) for s in symbols}
-        processors = [
-            SymbolProcessor(
-                symbol=s,
-                state=states[s],
-                rest=rest,
-                bus=bus,
-                metrics=METRICS,
-                depth_snapshot_limit=settings.ws.depth_snapshot_limit,
-            )
-            for s in symbols
-        ]
-        for proc in processors:
-            await proc.start()
-
-        engine = FeatureEngine(settings.features, news_store, METRICS)
-        feature_out: asyncio.Queue = asyncio.Queue(maxsize=10_000)
+        md = _MarketData(settings, rest, symbols, stop_event)
+        await md.start()
         signal_engine = SignalEngine(settings.strategies)
-
-        workers = [
-            asyncio.create_task(
-                _feature_worker(states[s], engine, feature_out, stop_event, settings.features.interval_s)
-            )
-            for s in symbols
+        extra = [
+            asyncio.create_task(_feature_sink(md.out, repo, signal_engine, stop_event), name="sink"),
+            asyncio.create_task(_metrics_summary(stop_event), name="metrics"),
         ]
-        sink = asyncio.create_task(
-            _feature_sink(feature_out, repo, signal_engine, stop_event)
-        )
-        metrics_task = asyncio.create_task(_metrics_summary(stop_event))
-        ws = WebSocketManager(settings.ws, bus, METRICS)
-        ws_task = asyncio.create_task(ws.run(symbols, stop_event))
-
         log.info("pipeline ready", extra={"symbols": len(symbols)})
-        await stop_event.wait()
+        rc = await _supervise({"sink": extra[0], "ws": md.tasks[0]}, stop_event)
     finally:
         stop_event.set()
-        for t in [*workers, sink, metrics_task, ws_task]:
-            if t is not None:
-                t.cancel()
-        await asyncio.gather(
-            *[t for t in [*workers, sink, metrics_task, ws_task] if t is not None],
-            return_exceptions=True,
-        )
-        for proc in processors:
-            await proc.close()
+        for t in extra:
+            t.cancel()
+        await asyncio.gather(*extra, return_exceptions=True)
+        if md is not None:
+            await md.close()
         await repo.close()
         await rest.close()
-    return 0
+    return rc
 
 
-# ── Paper trading (FASE 7) ────────────────────────────────────────────────────
+# ── Paper / testnet trading ───────────────────────────────────────────────────
 
 
 async def run_paper(settings: Settings, args: argparse.Namespace) -> int:
-    """Full data pipeline + simulated execution + periodic reconciliation.
+    """Real market data + execution on the configured venue, 24/7.
 
-    The venue is `SimulatedExecutionAdapter`; every order stays offline and
-    the audit trail goes to the SQLite repository. `--trades N` caps the
-    session at N closed trades (one-shot paper).
+    ``EXECUTION_VENUE=paper`` (default) simulates fills; ``testnet`` sends real
+    orders to the Binance Futures demo account. ``--trades N`` stops after N
+    closed trades; without it the bot runs until SIGTERM. The embedded HTTP
+    server exposes /healthz and the dashboard on $PORT.
     """
+    from crypto_scalper.execution.filters import FilterRegistry
+    from crypto_scalper.monitoring.runtime import RuntimeState
+    from crypto_scalper.server.app import start_server
+
+    venue_cfg = settings.venue
+    venue = getattr(args, "venue", None) or venue_cfg.effective_venue()
+    if venue == "testnet" and not venue_cfg.has_credentials:
+        log.error("testnet venue requires BINANCE_TESTNET_API_KEY/SECRET")
+        return 2
     rest = BinanceFuturesRest(settings.rest_url)
-    bus = EventBus(queue_maxsize=settings.ws.event_queue_maxsize // 10)
-    news_store = NewsStore()
     stop_event = asyncio.Event()
     _install_signal_handlers(stop_event)
+
+    runtime = RuntimeState(venue=venue, requested_venue=venue_cfg.venue, mode="trading",
+                           db_path=str(settings.paper.db_path))
+    if venue_cfg.venue == "testnet" and venue != "testnet":
+        runtime.note("EXECUTION_VENUE=testnet sin API keys: corriendo en paper")
+        log.warning("testnet requested without credentials; running on paper")
 
     strategy = dataclasses.replace(settings.strategies, enabled=True)
     signal_engine = SignalEngine(strategy)
     repository, notifier = _build_observability_repository(
         SqliteRepository(settings.paper.db_path),
         settings,
-        mode="paper",
+        mode=venue,
         alerts=True,
-    )
-    feature_out: asyncio.Queue = asyncio.Queue(maxsize=10_000)
-    engine = PaperTradingEngine(
-        settings=settings,
-        signal_engine=signal_engine,
-        source=_snapshot_source(feature_out, stop_event),
-        repository=repository,
+        start_equity=settings.paper.start_equity,
     )
 
-    states: dict = {}
-    processors: List[SymbolProcessor] = []
-    workers: List[asyncio.Task] = []
-    metrics_task: Optional[asyncio.Task] = None
-    ws_task: Optional[asyncio.Task] = None
-    engine_task: Optional[asyncio.Task] = None
-
+    runner = None
+    mirror = None
+    md: Optional[_MarketData] = None
+    engine: Optional[PaperTradingEngine] = None
+    tasks: dict = {}
+    rc = 0
     try:
+        # The dashboard/health endpoint comes up first so the platform sees
+        # the service as starting even while the universe is resolved.
+        runner = await start_server(settings, runtime)
         await rest.start()
-        symbols = await _resolve_universe(settings, rest)
+        # Shared cloud IPs are sometimes REST-banned by Binance (HTTP 418):
+        # public metadata falls back to the demo host; market data itself
+        # comes from WebSocket streams, which need no REST at all.
+        demo = BinanceFuturesRest(settings.venue.testnet_rest_url)
+        await demo.start()
+        try:
+            for src in (rest, demo):
+                try:
+                    offset = await asyncio.wait_for(clock.sync_with(src), timeout=8)
+                    log.info("clock synced with exchange", extra={"offset_ms": offset})
+                    break
+                except Exception as exc:  # noqa: BLE001 - fall back to host clock
+                    log.warning("clock sync failed", extra={"error": repr(exc)[:160]})
+            symbols = await _resolve_universe(settings, rest)
+            runtime.symbols = list(symbols)
 
-        states = {s: SymbolState(s) for s in symbols}
-        processors = [
-            SymbolProcessor(
-                symbol=s,
-                state=states[s],
-                rest=rest,
-                bus=bus,
-                metrics=METRICS,
-                depth_snapshot_limit=settings.ws.depth_snapshot_limit,
-            )
-            for s in symbols
-        ]
-        for proc in processors:
-            await proc.start()
+            filters = FilterRegistry()
+            for src in (rest, demo, rest):
+                try:
+                    # Real exchange grid even on paper, so paper sizing == testnet sizing.
+                    info = await asyncio.wait_for(src.exchange_info(), timeout=10)
+                    filters = FilterRegistry.from_exchange_info({"symbols": info}, symbols)
+                    if len(filters):
+                        break
+                except Exception as exc:  # noqa: BLE001 - paper can fall back to defaults
+                    log.warning("exchange filters unavailable", extra={"error": repr(exc)[:160]})
+            if not len(filters):
+                runtime.note("filtros del exchange no disponibles: redondeo por defecto")
+        finally:
+            await demo.close()
 
-        feature_engine = FeatureEngine(settings.features, news_store, METRICS)
-        workers = [
-            asyncio.create_task(
-                _feature_worker(states[s], feature_engine, feature_out, stop_event,
-                                settings.features.interval_s)
-            )
-            for s in symbols
-        ]
+        if venue == "testnet":
+            from crypto_scalper.execution.binance_futures import preflight
+            problem = await preflight(settings)
+            if problem:
+                log.error("testnet preflight failed; staying on paper", extra={"reason": problem})
+                runtime.note(f"testnet no disponible ({problem}); corriendo en paper")
+                venue = "paper"
+                runtime.venue = "paper"
+            else:
+                runtime.note("testnet preflight OK: API keys válidas")
+
+        mirror = await _start_mirror(settings, venue, runtime)
+
+        md = _MarketData(settings, rest, symbols, stop_event)
+        runtime.states = md.states
+        runtime.ws_manager = md.ws
+        engine = PaperTradingEngine(
+            settings=settings,
+            signal_engine=signal_engine,
+            source=_snapshot_source(md.out, stop_event),
+            repository=repository,
+            venue=venue,
+            filters=filters,
+            symbols=symbols,
+            price_source=md.latest_price,
+            runtime=runtime,
+            max_snapshot_age_ms=int(max(5.0, 5 * settings.features.interval_s) * 1000),
+            mirror=mirror,
+            flatten_on_shutdown=settings.durability.flatten_paper_on_shutdown,
+        )
+        if mirror is not None:
+            await _restore_from_mirror(mirror, engine, repository, venue, runtime)
+        await md.start()
         if notifier is not None:
             await notifier.start()
-        engine_task = asyncio.create_task(
-            _run_engine_guarded(engine, args, notifier)
-        )
-        metrics_task = asyncio.create_task(_metrics_summary(stop_event))
-        ws = WebSocketManager(settings.ws, bus, METRICS)
-        ws_task = asyncio.create_task(ws.run(symbols, stop_event))
-
-        log.info("paper pipeline ready",
-                 extra={"symbols": len(symbols),
+        tasks = {
+            "engine": asyncio.create_task(_run_engine_guarded(engine, args, notifier, runtime),
+                                          name="engine"),
+            "ws": md.tasks[0],
+        }
+        metrics_task = asyncio.create_task(_metrics_summary(stop_event, rest), name="metrics")
+        keepalive_task = None
+        runtime.keepalive = _KEEPALIVE_STATE
+        if settings.durability.keepalive_url:
+            keepalive_task = asyncio.create_task(
+                _keepalive(settings.durability.keepalive_url,
+                           settings.durability.keepalive_interval_s, stop_event),
+                name="keepalive")
+        log.info("trading pipeline ready",
+                 extra={"venue": venue, "symbols": ",".join(symbols),
                         "equity": settings.paper.start_equity,
-                        "db": str(settings.paper.db_path)})
-        await stop_event.wait()
-        engine.stop()
+                        "db": str(settings.paper.db_path),
+                        "port": settings.server.port})
+        runtime.note(f"arranque: venue={venue} símbolos={','.join(symbols)}")
+        rc = await _supervise(tasks, stop_event)
+        metrics_task.cancel()
+        if keepalive_task is not None:
+            keepalive_task.cancel()
+    except Exception:  # noqa: BLE001 - startup failure must exit non-zero
+        log.exception("trading pipeline failed to start")
+        rc = 1
     finally:
         stop_event.set()
-        engine.stop()
-        for t in [*workers, engine_task, metrics_task, ws_task]:
-            if t is not None:
-                t.cancel()
-        await asyncio.gather(
-            *[t for t in [*workers, engine_task, metrics_task, ws_task] if t is not None],
-            return_exceptions=True,
-        )
+        if engine is not None:
+            engine.stop()
+        for t in tasks.values():
+            t.cancel()
+        await asyncio.gather(*tasks.values(), return_exceptions=True)
         if notifier is not None:
             try:
-                await notifier.stop()
+                await asyncio.wait_for(notifier.stop(), timeout=5.0)
             except Exception:  # noqa: BLE001 - shutdown debe ser best-effort
                 log.warning("notifier stop failed", exc_info=True)
-        for proc in processors:
-            await proc.close()
+        if md is not None:
+            await md.close()
         await rest.close()
-    return 0
+        if mirror is not None:
+            await mirror.close()
+        if runner is not None:
+            await runner.cleanup()
+    return rc
+
+
+async def _start_mirror(settings: Settings, venue: str, runtime):
+    """Firestore (Firebase Spark) durable mirror; None when not configured."""
+    dur = settings.durability
+    if not dur.firestore_enabled:
+        return None
+    from crypto_scalper.storage.firestore_mirror import FirestoreMirror
+
+    mirror = FirestoreMirror.from_env(
+        dur.firebase_service_account, bot_id=dur.bot_id or venue,
+        equity_interval_s=dur.equity_interval_s, flush_interval_s=dur.flush_interval_s)
+    if mirror is None:
+        runtime.note("Firestore: credenciales inválidas; sin persistencia durable")
+        return None
+    try:
+        await mirror.start()
+    except Exception as exc:  # noqa: BLE001 - durability is optional, trading is not
+        log.error("firestore unavailable", extra={"error": repr(exc)})
+        runtime.note(f"Firestore no disponible: {type(exc).__name__}")
+        await mirror.close(timeout_s=1.0)
+        return None
+    runtime.mirror = mirror
+    return mirror
+
+
+async def _restore_from_mirror(mirror, engine, repository, venue: str, runtime) -> None:
+    """Resume account + history after a restart on an ephemeral filesystem."""
+    from crypto_scalper.core.enums import PositionStatus
+    from crypto_scalper.core.models import HeartbeatSnapshot, ManagedPosition
+
+    try:
+        state = await mirror.load_state()
+        if state:
+            engine.restore_state(state)
+        inner = getattr(repository, "inner", repository)
+        if hasattr(inner, "count_rows") and inner.count_rows("positions") == 0:
+            since = int(time.time() * 1000) - 7 * 86_400_000
+            trades = await mirror.load_collection("trades", order_field="closed_ts_ms",
+                                                  since=since, limit=500)
+            for t in trades:
+                await inner.save_position(ManagedPosition(
+                    position_id=t["position_id"], symbol=t["symbol"], side=t["side"],
+                    quantity=float(t["quantity"]), ordered_quantity=float(t["quantity"]),
+                    entry_price=float(t["entry_price"]),
+                    stop_loss_price=float(t.get("stop_loss_price", 0.0)),
+                    take_profit_price=float(t.get("take_profit_price", 0.0)),
+                    notional_value=float(t.get("notional_value", 0.0)),
+                    risk_amount=float(t.get("risk_amount", 0.0)),
+                    regime=str(t.get("regime", "")), status=PositionStatus.CLOSED,
+                    entry_client_order_id=f"ENTRY-{t['position_id'].upper()}",
+                    opened_ts_ms=int(t.get("opened_ts_ms", 0)),
+                    closed_ts_ms=int(t.get("closed_ts_ms", 0)),
+                    realized_pnl=float(t.get("realized_pnl", 0.0)),
+                    close_reason=str(t.get("close_reason", "")),
+                    fees=float(t.get("fees", 0.0)), exit_price=float(t.get("exit_price", 0.0)),
+                ))
+            points = await mirror.load_collection("equity", order_field="ts_ms",
+                                                  since=since, limit=2100)
+            for p in points:
+                await inner.save_heartbeat(HeartbeatSnapshot(
+                    ts_ms=int(p["ts_ms"]), mode=venue, status="restored",
+                    equity=float(p["equity"]), realized_pnl=float(p.get("realized", 0.0)),
+                    unrealized_pnl=float(p.get("unrealized", 0.0)),
+                    drawdown_pct=float(p.get("drawdown_pct", 0.0)), total_exposure=0.0,
+                    open_count=int(p.get("open_count", 0)), trades_today=0, uptime_ms=0))
+            runtime.note(f"restaurado de Firestore: {len(trades)} trades, {len(points)} puntos de equity")
+        elif state:
+            runtime.note("estado restaurado de Firestore")
+    except Exception as exc:  # noqa: BLE001 - a failed restore must not block trading
+        log.exception("firestore restore failed")
+        runtime.note(f"restauración Firestore falló: {type(exc).__name__}")
+
+
+_KEEPALIVE_STATE: dict = {"target": "", "last_ms": 0, "last_status": None}
+
+
+async def _keepalive(url: str, interval_s: float, stop_event: asyncio.Event) -> None:
+    """Self-ping the public URL so free hosts that idle-sleep keep the bot up."""
+    import aiohttp
+
+    target = url.rstrip("/") + "/healthz"
+    _KEEPALIVE_STATE["target"] = target
+    log.info("keepalive enabled", extra={"target": target, "interval_s": interval_s})
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval_s)
+                return
+            except asyncio.TimeoutError:
+                pass
+            try:
+                async with session.get(target) as resp:
+                    METRICS.incr("keepalive.ok" if resp.status < 500 else "keepalive.bad")
+                    _KEEPALIVE_STATE.update(last_ms=int(time.time() * 1000), last_status=resp.status)
+            except Exception as exc:  # noqa: BLE001
+                METRICS.incr("keepalive.error")
+                log.debug("keepalive failed", extra={"error": repr(exc)})
 
 
 async def _run_engine_guarded(
     engine: PaperTradingEngine,
     args: argparse.Namespace,
     notifier: Optional[TelegramNotifier],
+    runtime=None,
 ) -> None:
     """Run del motor con alerta CRITICAL_ERROR en caso de crash fatal."""
     try:
@@ -310,7 +528,9 @@ async def _run_engine_guarded(
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 - cualquier crash fatal se reporta
-        log.exception("paper engine crashed")
+        log.exception("trading engine crashed")
+        if runtime is not None:
+            runtime.engine_error = f"{type(exc).__name__}: {exc}"[:300]
         if notifier is not None:
             notifier.notify_critical_error(f"{type(exc).__name__}: {exc}")
         raise
@@ -337,8 +557,7 @@ def _build_observability_repository(
     """Envuelve el repo SQLite con el observador (alerts + heartbeat).
 
     Devuelve (repo_observado, notifier). El notifier queda SIN start() aquí;
-    el caller lo arranca/para alrededor del ciclo del motor. Con $ None (o sin
-    observer) devuelve (None|repo, None) para no cambiar comportamiento.
+    el caller lo arranca/para alrededor del ciclo del motor.
     """
     mon = settings.monitoring
     if repository is None:
@@ -362,6 +581,9 @@ def _build_observability_repository(
     return wrapped, notifier
 
 
+_MAX_DATA_AGE_MS = 15_000
+
+
 async def _feature_worker(
     state: SymbolState,
     engine: FeatureEngine,
@@ -369,20 +591,35 @@ async def _feature_worker(
     stop_event: asyncio.Event,
     interval_s: float,
 ) -> None:
+    """Emit one snapshot per interval while the symbol's data is fresh.
+
+    A stale or unsynchronized symbol emits nothing (never trade on a frozen
+    book); a full queue drops the OLDEST snapshot, keeping decisions current.
+    """
+    loop = asyncio.get_running_loop()
+    next_t = loop.time()
     while not stop_event.is_set():
         try:
-            if state.is_ready():
-                snapshot = engine.compute(state)
-                try:
-                    out_q.put_nowait(snapshot)
-                except asyncio.QueueFull:
-                    METRICS.incr("features.queue_full")
-                    log.error("feature queue full", extra={"symbol": state.symbol})
+            now_ms = clock.now_ms()
+            if state.is_ready() and state.data_age_ms(now_ms) <= _MAX_DATA_AGE_MS:
+                snapshot = engine.compute(state, now_ms=now_ms)
+                if out_q.full():
+                    try:
+                        out_q.get_nowait()
+                        METRICS.incr("features.dropped_oldest")
+                    except asyncio.QueueEmpty:
+                        pass
+                out_q.put_nowait(snapshot)
+            elif state.orderbook.has_snapshot:
+                METRICS.incr(f"features.{state.symbol}.not_fresh")
         except MarketDataNotReady:
             pass  # still warming up; normal before the first candles exist
         except Exception:  # noqa: BLE001
             log.exception("feature worker error", extra={"symbol": state.symbol})
-        await asyncio.sleep(interval_s)
+        next_t += interval_s
+        await asyncio.sleep(max(0.0, next_t - loop.time()))
+        if loop.time() - next_t > 5 * interval_s:
+            next_t = loop.time()  # we fell behind (e.g. GC/CPU spike): resync cadence
 
 
 async def _feature_sink(
@@ -436,11 +673,19 @@ def _log_signal(signal, snapshot: FeatureSnapshot) -> None:
     )
 
 
-async def _metrics_summary(stop_event: asyncio.Event) -> None:
+async def _metrics_summary(stop_event: asyncio.Event, rest=None) -> None:
+    n = 0
     while not stop_event.is_set():
-        await asyncio.sleep(30.0)
+        await asyncio.sleep(60.0)
+        n += 1
+        if rest is not None and n % 10 == 0:
+            try:
+                await clock.sync_with(rest)
+            except Exception:  # noqa: BLE001
+                pass
         snap = METRICS.snapshot()
-        log.info("metrics summary", extra=snap)
+        counters = {k[len("counter."):]: v for k, v in snap.items() if k.startswith("counter.")}
+        log.info("metrics summary", extra={"metrics": counters})
 
 
 # ── Backtest (FASE 8) ────────────────────────────────────────────────────────

@@ -18,6 +18,8 @@ from typing import TYPE_CHECKING, Dict, Optional
 
 import numpy as np
 
+from crypto_scalper.core import clock
+
 from crypto_scalper.config.settings import FeatureConfig
 from crypto_scalper.core.models import FeatureSnapshot, OrderBookMetrics
 from crypto_scalper.core.enums import Impact, Regime
@@ -49,10 +51,13 @@ class FeatureEngine:
         self._regime = regime_classifier or MarketRegime()
         self._last_obi: Dict[str, float] = {}
         self._predictor = predictor
+        # Indicators only need a bounded window; recomputing over the whole
+        # 2000-candle history every second is the dominant CPU cost.
+        self._lookback = max(120, int(getattr(config, "lookback_candles", 900)))
 
     def compute(self, state: SymbolState, now_ms: Optional[int] = None) -> FeatureSnapshot:
-        now_ms = now_ms or int(time.time() * 1000)
-        series = state.candles.series()
+        now_ms = now_ms or clock.now_ms()
+        series = _tail(state.candles.series(), self._lookback)
         if len(series.close) < 2 or np.isnan(series.close[-1]):
             raise MarketDataNotReady(f"{state.symbol}: not enough candle data")
 
@@ -87,7 +92,7 @@ class FeatureEngine:
         vol = volume_features.volume_features(state.trades, now_ms)
 
         ob: Optional[OrderBookMetrics] = None
-        if state.orderbook.has_snapshot:
+        if state.orderbook.is_synced:
             try:
                 ob = state.orderbook.metrics(self._config.depth_pct_buckets)
             except Exception:  # noqa: BLE001 - OBI is optional for the snapshot
@@ -222,3 +227,13 @@ def _nan_to(value: float, fallback: float) -> float:
     if value is None or (isinstance(value, float) and (np.isnan(value) or np.isinf(value))):
         return fallback
     return float(value)
+
+
+def _tail(series, n: int):
+    """Return a CandleSeries view restricted to the last ``n`` candles."""
+    if len(series.close) <= n:
+        return series
+    import dataclasses
+    return dataclasses.replace(
+        series, **{f.name: getattr(series, f.name)[-n:] for f in dataclasses.fields(series)}
+    )

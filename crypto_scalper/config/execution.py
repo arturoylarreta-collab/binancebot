@@ -33,3 +33,26 @@ class ExecutionConfig:
     # Default risk-pass-through tuning used by the ExecutionRouter.
     default_rr_ratio: float = 2.0
     default_sl_atr_mult: float = 1.5
+
+    # Taker commission used to estimate fees when the venue report carries none
+    # (simulator). Realized PnL fed to risk limits is always NET of fees.
+    fee_pct: float = 0.0004
+    # After a loss streak pauses trading, resume once this long has passed
+    # without a new loss (0 = stay paused until restart).
+    loss_streak_cooldown_s: float = 1800.0
+    # How long a MARKET entry may stay unfilled before it is cancelled.
+    entry_fill_timeout_s: float = 5.0
+
+    def __post_init__(self) -> None:
+        if self.retries < 0:
+            raise ValueError("retries must be >= 0")
+        for name in ("submit_timeout_s", "fill_timeout_s", "protection_timeout_s",
+                     "entry_fill_timeout_s"):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be > 0")
+        if not 0 <= self.slippage_pct < 0.05:
+            raise ValueError("slippage_pct must be in [0, 0.05)")
+        if not 0 <= self.fee_pct < 0.01:
+            raise ValueError("fee_pct must be in [0, 0.01)")
+        if self.event_queue_size < 10:
+            raise ValueError("event_queue_size must be >= 10")

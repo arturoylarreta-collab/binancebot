@@ -83,6 +83,16 @@ class PaperAccount:
     def peak_equity(self) -> float:
         return self._peak_equity
 
+    def restore(self, *, cash: float, realized_pnl: float, fees_paid: float,
+                peak_equity: float, start_equity: float = 0.0) -> None:
+        """Resume a previous session (durable mirror) instead of resetting."""
+        if start_equity > 0:
+            self._start_equity = float(start_equity)
+        self._cash = float(cash)
+        self._realized_pnl = float(realized_pnl)
+        self._fees_paid = float(fees_paid)
+        self._peak_equity = max(float(peak_equity), self._cash)
+
     # ── accounting ───────────────────────────────────────────────────────────
 
     def realize_close(self, position: ManagedPosition) -> None:
@@ -92,9 +102,11 @@ class PaperAccount:
             return
         sign = 1.0 if position.side == "BUY" else -1.0
         exit_price = position.entry_price + position.realized_pnl / (sign * qty)
-        entry_notional = position.notional_value or position.entry_price * qty
-        exit_notional = max(0.0, exit_price) * qty
-        fee = (entry_notional + exit_notional) * self._fee_pct
+        fee = float(getattr(position, "fees", 0.0) or 0.0)
+        if fee <= 0:
+            entry_notional = position.notional_value or position.entry_price * qty
+            exit_notional = max(0.0, exit_price) * qty
+            fee = (entry_notional + exit_notional) * self._fee_pct
         self._realized_pnl += float(position.realized_pnl)
         self._fees_paid += fee
         self._cash += float(position.realized_pnl) - fee
@@ -132,3 +144,48 @@ class PaperAccount:
 
     def equity(self, unrealized_pnl: float = 0.0) -> float:
         return self.stats(unrealized_pnl=unrealized_pnl).equity
+
+
+class VenueAccount(PaperAccount):
+    """Account mirrored from a real venue (Binance testnet/live).
+
+    Equity comes from the exchange (wallet balance + unrealized PnL) and is
+    refreshed by the engine; realized PnL / fees keep the same bookkeeping as
+    the paper account so reports stay comparable across venues.
+    """
+
+    def __init__(self, start_equity: float, fee_pct: float = 0.0) -> None:
+        super().__init__(start_equity, fee_pct)
+        self._venue_wallet: float = float(start_equity)
+        self._venue_unrealized: float = 0.0
+        self._synced = False
+
+    def sync(self, wallet_balance: float, unrealized_pnl: float) -> None:
+        self._venue_wallet = float(wallet_balance)
+        self._venue_unrealized = float(unrealized_pnl)
+        self._synced = True
+
+    @property
+    def synced(self) -> bool:
+        return self._synced
+
+    @property
+    def cash(self) -> float:
+        return self._venue_wallet if self._synced else super().cash
+
+    def stats(self, unrealized_pnl: float = 0.0) -> PaperAccountStats:
+        if not self._synced:
+            return super().stats(unrealized_pnl)
+        unreal = self._venue_unrealized
+        equity = self._venue_wallet + unreal
+        if equity > self._peak_equity:
+            self._peak_equity = equity
+        return PaperAccountStats(
+            start_equity=self._start_equity,
+            cash=self._venue_wallet,
+            realized_pnl=self._realized_pnl,
+            fees_paid=self._fees_paid,
+            unrealized_pnl=unreal,
+            equity=equity,
+            peak_equity=self._peak_equity,
+        )

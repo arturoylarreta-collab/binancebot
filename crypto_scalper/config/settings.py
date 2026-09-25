@@ -12,6 +12,7 @@ from crypto_scalper.config.monitoring import MonitoringConfig
 from crypto_scalper.config.paper import PaperConfig
 from crypto_scalper.config.risk import RiskConfig
 from crypto_scalper.config.strategies import DEFAULT_SIGNAL_WEIGHTS, StrategyConfig
+from crypto_scalper.config.venue import DurabilityConfig, ServerConfig, VenueConfig
 from crypto_scalper.core.enums import Environment, Regime
 from crypto_scalper.core.exceptions import ConfigurationError
 
@@ -20,9 +21,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 def _load_dotenv_for_environment() -> None:
     """Loads .env then the environment-specific override file (.env.<APP_ENV>)."""
-    app_env = os.environ.get("APP_ENV", "dev")
+    # .env first: APP_ENV may itself be defined there.
     load_dotenv(PROJECT_ROOT / ".env", override=False)
+    app_env = os.environ.get("APP_ENV", "dev")
     load_dotenv(PROJECT_ROOT / f".env.{app_env}", override=False)
+
+
+def _as_path(name: str, default: str) -> Path:
+    """Relative paths resolve against the project root, never the CWD, so the
+    bot and the dashboard always agree on the same files."""
+    p = Path(_as_str(name, default)).expanduser()
+    return p if p.is_absolute() else PROJECT_ROOT / p
 
 
 def _as_float(name: str, default: float) -> float:
@@ -69,6 +78,7 @@ class WebSocketConfig:
     reconnect_factor: float
     event_queue_maxsize: int
     depth_snapshot_limit: int
+    depth_mode: str = "partial"
 
 
 @dataclass(frozen=True)
@@ -117,6 +127,9 @@ class Settings:
     paper: PaperConfig = field(default_factory=PaperConfig)
     backtest: BacktestConfig = field(default_factory=BacktestConfig)
     monitoring: MonitoringConfig = field(default_factory=MonitoringConfig)
+    venue: VenueConfig = field(default_factory=VenueConfig)
+    server: ServerConfig = field(default_factory=ServerConfig)
+    durability: DurabilityConfig = field(default_factory=DurabilityConfig)
 
     @classmethod
     def load(cls) -> "Settings":
@@ -136,7 +149,8 @@ class Settings:
 
         _validate_ws_numbers()
         ws = WebSocketConfig(
-            url=_as_str("BINANCE_FUTURES_WS_URL", "wss://fstream.binance.com/stream"),
+            url=_as_str("BINANCE_FUTURES_WS_URL", "wss://fstream.binance.com"),
+            depth_mode=_as_str("WS_DEPTH_MODE", "partial").lower(),
             batch_size=_as_int("WS_BATCH_SIZE", 20),
             conn_timeout_s=_as_float("WS_CONN_TIMEOUT_S", 30.0),
             ping_interval_s=_as_float("WS_PING_INTERVAL_S", 20.0),
@@ -169,7 +183,7 @@ class Settings:
             data=DataConfig(),
             log_level=_as_str("LOG_LEVEL", "INFO").upper(),
             log_format=_as_str("LOG_FORMAT", "kv"),
-            log_dir=Path(_as_str("LOG_DIR", "logs")),
+            log_dir=_as_path("LOG_DIR", "logs"),
             explicit_symbols=explicit,
             strategies=_load_strategy_config(),
             execution=ExecutionConfig(
@@ -183,6 +197,35 @@ class Settings:
                 event_queue_size=_as_int("EXECUTION_EVENT_QUEUE_SIZE", 1000),
                 default_rr_ratio=_as_float("EXECUTION_DEFAULT_RR_RATIO", 2.0),
                 default_sl_atr_mult=_as_float("EXECUTION_DEFAULT_SL_ATR_MULT", 1.5),
+                fee_pct=_as_float("EXECUTION_FEE_PCT", 0.0004),
+                loss_streak_cooldown_s=_as_float("RISK_LOSS_STREAK_COOLDOWN_S", 1800.0),
+                entry_fill_timeout_s=_as_float("EXECUTION_ENTRY_FILL_TIMEOUT_S", 5.0),
+            ),
+            venue=VenueConfig(
+                venue=_as_str("EXECUTION_VENUE", "paper").lower(),
+                testnet_rest_url=_as_str("BINANCE_TESTNET_REST_URL", "https://demo-fapi.binance.com"),
+                testnet_ws_url=_as_str("BINANCE_TESTNET_WS_URL", "wss://demo-fstream.binance.com"),
+                api_key=_as_str("BINANCE_TESTNET_API_KEY", ""),
+                api_secret=_as_str("BINANCE_TESTNET_API_SECRET", ""),
+                recv_window_ms=_as_int("BINANCE_RECV_WINDOW_MS", 5000),
+                poll_interval_s=_as_float("BINANCE_POLL_INTERVAL_S", 2.0),
+                fallback_to_paper=_as_bool("TESTNET_FALLBACK_TO_PAPER", True),
+            ),
+            durability=DurabilityConfig(
+                firebase_service_account=_as_str("FIREBASE_SERVICE_ACCOUNT_JSON", ""),
+                bot_id=_as_str("FIRESTORE_BOT_ID", ""),
+                equity_interval_s=_as_float("FIRESTORE_EQUITY_INTERVAL_S", 300.0),
+                flush_interval_s=_as_float("FIRESTORE_FLUSH_INTERVAL_S", 15.0),
+                flatten_paper_on_shutdown=_as_bool("PAPER_FLATTEN_ON_SHUTDOWN", True),
+                keepalive_url=_as_str("KEEPALIVE_URL", _as_str("RENDER_EXTERNAL_URL", "")),
+                keepalive_interval_s=_as_float("KEEPALIVE_INTERVAL_S", 600.0),
+            ),
+            server=ServerConfig(
+                enabled=_as_bool("HTTP_ENABLED", True),
+                host=_as_str("HTTP_HOST", "0.0.0.0"),
+                port=_as_int("PORT", 8080),
+                control_token=_as_str("DASHBOARD_CONTROL_TOKEN", ""),
+                dashboard_password=_as_str("DASHBOARD_PASSWORD", ""),
             ),
             risk=_load_risk_config(),
             paper=_load_paper_config(),
@@ -234,6 +277,8 @@ def _load_risk_config() -> RiskConfig:
         max_total_open_risk_pct=_as_float("RISK_MAX_TOTAL_OPEN_RISK_PCT", 0.03),
         max_positions=_as_int("RISK_MAX_POSITIONS", 10),
         max_leverage=_as_int("RISK_MAX_LEVERAGE", 1),
+        min_stop_pct=_as_float("RISK_MIN_STOP_PCT", 0.0005),
+        max_stop_pct=_as_float("RISK_MAX_STOP_PCT", 0.05),
         daily_loss_limit_pct=_as_float("RISK_DAILY_LOSS_LIMIT_PCT", 0.03),
         max_drawdown_pct=_as_float("RISK_MAX_DRAWDOWN_PCT", 0.10),
         correlated_group_exposure_cap_pct=_as_float(
@@ -250,7 +295,7 @@ def _load_paper_config() -> PaperConfig:
         reconcile_interval_s=_as_float("PAPER_RECONCILE_INTERVAL_S", 60.0),
         summary_interval_s=_as_float("PAPER_SUMMARY_INTERVAL_S", 30.0),
         max_open_per_symbol=_as_int("PAPER_MAX_OPEN_PER_SYMBOL", 1),
-        db_path=Path(_as_str("PAPER_DB_PATH", "logs/paper.db")),
+        db_path=_as_path("PAPER_DB_PATH", "logs/paper.db"),
     )
 
 
@@ -259,7 +304,7 @@ def _load_backtest_config() -> BacktestConfig:
     from crypto_scalper.config.backtest import CostModelConfig
 
     return BacktestConfig(
-        data_dir=Path(_as_str("BACKTEST_DATA_DIR", "data/klines")),
+        data_dir=_as_path("BACKTEST_DATA_DIR", "data/klines"),
         interval_s=_as_int("BACKTEST_INTERVAL_S", 60),
         warmup_bars=_as_int("BACKTEST_WARMUP_BARS", 60),
         fill_at=_as_str("BACKTEST_FILL_AT", "close").lower(),
@@ -276,7 +321,7 @@ def _load_backtest_config() -> BacktestConfig:
             minimum_required_edge_pct=_as_float("COST_MIN_EDGE_PCT", 0.0015),
         ),
         db_path=_as_str("BACKTEST_DB_PATH", ""),
-        model_path=Path(_as_str("BACKTEST_MODEL_PATH", "models/ml-predictor.joblib")),
+        model_path=_as_path("BACKTEST_MODEL_PATH", "models/ml-predictor.joblib"),
     )
 
 

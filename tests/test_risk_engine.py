@@ -120,7 +120,8 @@ class TestHierarchy:
 class TestDailyLossLimit:
     def test_rejected_when_daily_loss_at_limit(self):
         engine = RiskEngine(_config(daily_loss_limit_pct=0.03))
-        portfolio = _portfolio(equity=10_000, daily_realized_pnl=-300.0)
+        # day opened at 10k: -300 realized → equity 9.7k → exactly 3% of day-start
+        portfolio = _portfolio(equity=9_700, daily_realized_pnl=-300.0)
         dec = engine.assess(_signal(), portfolio, entry_price=100.0, atr=1.0)
         assert dec.verdict == RiskVerdict.TRADING_HALTED.name
         assert dec.reason == RejectReason.DAILY_LOSS_LIMIT.name
@@ -212,3 +213,24 @@ class TestOffline:
         dec = engine.assess(_signal(), _portfolio(), entry_price=100.0, atr=1.0)
         assert dec.verdict in {RiskVerdict.APPROVED.name, RiskVerdict.REJECTED.name,
                                RiskVerdict.TRADING_HALTED.name, RiskVerdict.SAFE_MODE.name}
+
+class TestGrossLeverage:
+    def test_new_trade_shrinks_to_leverage_headroom(self):
+        engine = RiskEngine(_config(max_leverage=1))
+        open_pos = Position(symbol="ETHUSDT", side="BUY", entry_price=100.0, quantity=80.0,
+                            stop_loss_price=99.0, take_profit_price=102.0,
+                            notional_value=8_000.0, risk_amount=80.0)
+        portfolio = _portfolio(open_positions=(open_pos,))
+        dec = engine.assess(_signal(), portfolio, entry_price=100.0, atr=0.1)
+        assert dec.verdict == RiskVerdict.APPROVED.name
+        assert dec.notional_value <= 2_000.0 + 1e-6   # 10k equity × 1x − 8k open
+
+    def test_rejected_when_no_leverage_headroom(self):
+        engine = RiskEngine(_config(max_leverage=1))
+        open_pos = Position(symbol="ETHUSDT", side="BUY", entry_price=100.0, quantity=100.0,
+                            stop_loss_price=99.0, take_profit_price=102.0,
+                            notional_value=10_000.0, risk_amount=100.0)
+        dec = engine.assess(_signal(), _portfolio(open_positions=(open_pos,)),
+                            entry_price=100.0, atr=0.1)
+        assert dec.verdict == RiskVerdict.REJECTED.name
+        assert dec.reason == RejectReason.RISK_EXPOSURE_EXCEEDED.name

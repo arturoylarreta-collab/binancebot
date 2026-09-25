@@ -23,6 +23,7 @@ from crypto_scalper.core.enums import OrderStatus, OrderType
 from crypto_scalper.core.exceptions import (
     DuplicateOrderError,
     ExecutionError,
+    Fatal,
     InvalidOrderError,
     OrderRejectedError,
     OrderTimeoutError,
@@ -46,6 +47,7 @@ TERMINAL_STATUSES = frozenset({
 })
 
 _ORDER_TYPE_NAMES = {t.name for t in OrderType}
+_MAX_TERMINAL_CACHE = 500
 
 
 class OrderManager:
@@ -55,6 +57,7 @@ class OrderManager:
         self._orders: Dict[str, ExecutionReport] = {}
         self._inflight: Dict[str, "asyncio.Future[ExecutionReport]"] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._tasks: "set[asyncio.Task]" = set()  # strong refs: no GC mid-flight
 
     @property
     def adapter(self) -> ExchangeAdapter:
@@ -72,16 +75,33 @@ class OrderManager:
     async def refresh(self) -> None:
         """Sync the local cache with the venue (passive fills / cancellations).
 
-        Orders submitted here are re-fetched from the adapter so the cached
-        report reflects fills and status changes that happened on the venue
-        without a further submit (e.g. a stop-loss filled by a price tick, or
-        a sibling protection cancelled when a position closed).
+        Only non-terminal orders are re-fetched (terminal ones cannot change),
+        one failing lookup never aborts the pass, and the terminal cache is
+        bounded so a 24/7 session does not grow memory or REST load.
         """
-        for cid in list(self._orders):
-            symbol = self._orders[cid].symbol
-            report = await self._adapter.get_order(symbol, cid)
-            self._orders[cid] = report
+        for cid, cached in list(self._orders.items()):
+            if cached.is_terminal:
+                continue
+            try:
+                self._orders[cid] = await self._adapter.get_order(cached.symbol, cid)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - best-effort sync
+                METRICS.incr("execution.refresh_errors")
+                log.warning("order refresh failed",
+                            extra={"client_order_id": cid, "error": repr(exc)})
+        self._prune_terminal()
         METRICS.incr("execution.orders_refreshed")
+
+    def record(self, report: ExecutionReport) -> None:
+        """Update the cache from an out-of-band venue event (user-data stream)."""
+        if report.client_order_id:
+            self._orders[report.client_order_id] = report
+
+    def _prune_terminal(self) -> None:
+        terminal = [cid for cid, r in self._orders.items() if r.is_terminal]
+        for cid in terminal[:max(0, len(terminal) - _MAX_TERMINAL_CACHE)]:
+            self._orders.pop(cid, None)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -113,8 +133,11 @@ class OrderManager:
             self._loop = asyncio.get_running_loop()
         fut: "asyncio.Future[ExecutionReport]" = self._loop.create_future()
         self._inflight[client_id] = fut
-        asyncio.ensure_future(self._fulfill(client_id, request, fut, timeout_s, wait_fill))
-        return await fut
+        task = asyncio.ensure_future(self._fulfill(client_id, request, fut, timeout_s, wait_fill))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        # shield: a cancelled caller must not cancel the shared submission
+        return await asyncio.shield(fut)
 
     async def cancel(self, symbol: str, client_order_id: str) -> ExecutionReport:
         report = await self._adapter.cancel(symbol, client_order_id)
@@ -135,8 +158,11 @@ class OrderManager:
         """Cancel the old order (idempotent) then submit the replacement."""
         try:
             await self._adapter.cancel(symbol, old_client_order_id)
-        except ExecutionError:
-            pass  # already terminal on the venue
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - already terminal / unknown on the venue
+            log.info("cancel before replace failed",
+                     extra={"client_order_id": old_client_order_id, "error": repr(exc)})
         return await self.submit(new_request, wait_fill=False, timeout_s=timeout_s)
 
     # ── Internals ─────────────────────────────────────────────────────────────
@@ -179,7 +205,6 @@ class OrderManager:
                 report = await asyncio.wait_for(
                     self._adapter.submit(request), timeout=submit_timeout
                 )
-                return await self._settle(report, request, wait_fill)
             except DuplicateOrderError:
                 # Already accepted by the venue but we lost the ack: fetch the
                 # existing order — never re-submit (this is the idempotency win).
@@ -187,19 +212,28 @@ class OrderManager:
                 existing = await self._adapter.get_order(request.symbol, request.client_order_id)
                 return await self._settle(existing, request, wait_fill)
             except TimeoutError:
+                # The request may or may not have reached the venue: look it up
+                # before deciding; never blindly cancel an entry that filled.
+                existing = await self._lookup(request)
+                if existing is not None and existing.executed_quantity > 0:
+                    return await self._settle(existing, request, wait_fill)
                 await self._best_effort_cancel(request.client_order_id, request.symbol)
                 raise OrderTimeoutError(
                     f"submit timeout for {request.client_order_id}"
                 ) from None
-            except OrderTimeoutError:
-                # Fill-wait timeout already cancelled the order; retrying would
-                # "succeed" against the canceled terminal state. Surface it.
-                raise
             except Exception as exc:  # noqa: BLE001
-                if not isinstance(exc, (Recoverable, Transient)):
+                if isinstance(exc, (OrderRejectedError, Fatal)) or not isinstance(
+                    exc, (Recoverable, Transient)
+                ):
                     raise
                 last_exc = exc
                 METRICS.incr("execution.retry")
+                # Binance only dedupes client ids among OPEN orders: a MARKET
+                # order that filled before the error would be accepted twice.
+                # Always check the venue before re-submitting.
+                existing = await self._lookup(request)
+                if existing is not None:
+                    return await self._settle(existing, request, wait_fill)
                 if attempt < attempts - 1:
                     backoff = min(
                         self._config.backoff_base_s * (2 ** attempt),
@@ -213,9 +247,20 @@ class OrderManager:
                     })
                     await asyncio.sleep(backoff)
                     continue
+                break
+            return await self._settle(report, request, wait_fill)
 
         assert last_exc is not None
         raise last_exc
+
+    async def _lookup(self, request: OrderRequest) -> Optional[ExecutionReport]:
+        """Venue lookup by client id; None when the venue never saw the order."""
+        try:
+            return await self._adapter.get_order(request.symbol, request.client_order_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - not found / unreachable → treat as absent
+            return None
 
     async def _settle(
         self,
@@ -248,6 +293,7 @@ class OrderManager:
         its event stream settles.
         """
         deadline = time.monotonic() + deadline_s
+        poll_s = 0.02
         while True:
             report = await self._adapter.get_order(symbol, client_order_id)
             if report.is_terminal:
@@ -258,7 +304,8 @@ class OrderManager:
                     f"fill timeout for {client_order_id} "
                     f"(status={report.status}, filled={report.executed_quantity})"
                 )
-            await asyncio.sleep(0.02)
+            await asyncio.sleep(poll_s)
+            poll_s = min(poll_s * 2, 0.25)  # cheap offline, gentle on REST live
 
     async def _best_effort_cancel(
         self,
