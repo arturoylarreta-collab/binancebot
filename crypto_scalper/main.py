@@ -367,6 +367,7 @@ async def run_paper(settings: Settings, args: argparse.Namespace) -> int:
         }
         metrics_task = asyncio.create_task(_metrics_summary(stop_event, rest), name="metrics")
         keepalive_task = None
+        runtime.keepalive = _KEEPALIVE_STATE
         if settings.durability.keepalive_url:
             keepalive_task = asyncio.create_task(
                 _keepalive(settings.durability.keepalive_url,
@@ -479,11 +480,16 @@ async def _restore_from_mirror(mirror, engine, repository, venue: str, runtime) 
         runtime.note(f"restauración Firestore falló: {type(exc).__name__}")
 
 
+_KEEPALIVE_STATE: dict = {"target": "", "last_ms": 0, "last_status": None}
+
+
 async def _keepalive(url: str, interval_s: float, stop_event: asyncio.Event) -> None:
     """Self-ping the public URL so free hosts that idle-sleep keep the bot up."""
     import aiohttp
 
     target = url.rstrip("/") + "/healthz"
+    _KEEPALIVE_STATE["target"] = target
+    log.info("keepalive enabled", extra={"target": target, "interval_s": interval_s})
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
         while not stop_event.is_set():
             try:
@@ -494,6 +500,7 @@ async def _keepalive(url: str, interval_s: float, stop_event: asyncio.Event) -> 
             try:
                 async with session.get(target) as resp:
                     METRICS.incr("keepalive.ok" if resp.status < 500 else "keepalive.bad")
+                    _KEEPALIVE_STATE.update(last_ms=int(time.time() * 1000), last_status=resp.status)
             except Exception as exc:  # noqa: BLE001
                 METRICS.incr("keepalive.error")
                 log.debug("keepalive failed", extra={"error": repr(exc)})

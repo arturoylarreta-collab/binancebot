@@ -40,6 +40,7 @@ class RuntimeState:
     adapter: Any = None
     ws_manager: Any = None
     mirror: Any = None
+    keepalive: Any = None
     states: Dict[str, Any] = field(default_factory=dict)
     notes: List[str] = field(default_factory=list)
 
@@ -93,6 +94,7 @@ class RuntimeState:
             "books": books,
             "ws": ws_info,
         }
+        out["keepalive"] = dict(self.keepalive) if self.keepalive else None
         m = self.mirror
         out["firestore"] = None if m is None else {
             "project": m.project, "bot_id": m.bot_id, "writes_ok": m.writes_ok,
