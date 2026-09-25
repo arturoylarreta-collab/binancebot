@@ -18,6 +18,8 @@ from typing import TYPE_CHECKING, Dict, Optional
 
 import numpy as np
 
+from crypto_scalper.core import clock
+
 from crypto_scalper.config.settings import FeatureConfig
 from crypto_scalper.core.models import FeatureSnapshot, OrderBookMetrics
 from crypto_scalper.core.enums import Impact, Regime
@@ -54,7 +56,7 @@ class FeatureEngine:
         self._lookback = max(120, int(getattr(config, "lookback_candles", 900)))
 
     def compute(self, state: SymbolState, now_ms: Optional[int] = None) -> FeatureSnapshot:
-        now_ms = now_ms or int(time.time() * 1000)
+        now_ms = now_ms or clock.now_ms()
         series = _tail(state.candles.series(), self._lookback)
         if len(series.close) < 2 or np.isnan(series.close[-1]):
             raise MarketDataNotReady(f"{state.symbol}: not enough candle data")

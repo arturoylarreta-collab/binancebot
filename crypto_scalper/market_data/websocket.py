@@ -61,17 +61,40 @@ class WebSocketManager:
         size = self._config.batch_size
         return [streams[i : i + size] for i in range(0, len(streams), size)]
 
+    def routed_batches(self, symbols: List[str]) -> List[Tuple[str, List[str]]]:
+        """(url, streams) per physical connection.
+
+        Binance routes USD-M market streams by category: ``@aggTrade`` is only
+        delivered on ``/market`` and ``@depth`` on ``/public`` (a legacy
+        ``/stream`` connection silently receives depth only).
+        """
+        base = self._url.rstrip("/")
+        for suffix in ("/stream", "/ws"):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+        for suffix in ("/public", "/market"):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+        trades = [s for s in self.build_streams(symbols) if s.endswith("@aggTrade")]
+        depth = [s for s in self.build_streams(symbols) if not s.endswith("@aggTrade")]
+        out: List[Tuple[str, List[str]]] = []
+        for batch in self._batches(trades):
+            out.append((f"{base}/market/stream", batch))
+        for batch in self._batches(depth):
+            out.append((f"{base}/public/stream", batch))
+        return out
+
     async def run(self, symbols: List[str], stop_event: asyncio.Event) -> None:
         """Keep all connection tasks alive in parallel until stop is set."""
-        streams = self.build_streams(symbols)
-        batches = self._batches(streams)
-        log.info("ws manager starting", extra={"streams": len(streams), "connections": len(batches)})
-        self._metrics.set_gauge("ws.streams", len(streams))
+        batches = self.routed_batches(symbols)
+        n_streams = sum(len(b) for _, b in batches)
+        log.info("ws manager starting", extra={"streams": n_streams, "connections": len(batches)})
+        self._metrics.set_gauge("ws.streams", n_streams)
         self._metrics.set_gauge("ws.connections.target", len(batches))
 
         tasks = [
-            asyncio.create_task(self._run_connection(batch, idx))
-            for idx, batch in enumerate(batches)
+            asyncio.create_task(self._run_connection(batch, idx, url))
+            for idx, (url, batch) in enumerate(batches)
         ]
         self._tasks = tasks
         try:
@@ -79,14 +102,15 @@ class WebSocketManager:
         finally:
             for t in tasks:
                 t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _run_connection(self, streams: List[str], idx: int) -> None:
+    async def _run_connection(self, streams: List[str], idx: int, url: str = "") -> None:
         attempt = 0
         loop = asyncio.get_running_loop()
         while True:
             started = loop.time()
             try:
-                await self._connect_and_read(streams, idx)
+                await self._connect_and_read(streams, idx, url or self._url)
             except asyncio.CancelledError:
                 return
             except Exception as exc:  # noqa: BLE001 - reconnector must survive any failure
@@ -115,9 +139,9 @@ class WebSocketManager:
         jitter = random.uniform(0, min(0.5, delay * 0.2))
         return delay + jitter
 
-    async def _connect_and_read(self, streams: List[str], idx: int) -> None:
+    async def _connect_and_read(self, streams: List[str], idx: int, base_url: str = "") -> None:
         query = "/".join(streams)
-        url = f"{self._url}?streams={query}"
+        url = f"{base_url or self._url}?streams={query}"
         timeout = aiohttp.ClientTimeout(total=self._config.conn_timeout_s)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.ws_connect(url, autoping=True) as ws:

@@ -202,6 +202,31 @@ class RiskEngine:
             tick_size=tick_size, lot_size=lot_size,
         )
 
+        # Portfolio-level leverage: the per-trade cap alone lets N positions
+        # each use equity × leverage (N× gross exposure). Shrink the new trade
+        # to the headroom left under equity × max_leverage.
+        open_notional = sum(float(p.notional_value or 0.0) for p in portfolio.open_positions)
+        headroom = portfolio.equity * self._config.max_leverage - open_notional
+        checks["gross_leverage"] = headroom > 0
+        if sizing.quantity > 0 and _entry > 0 and sizing.notional_value > headroom:
+            import dataclasses as _dc
+            import math as _math
+            qty = max(0.0, headroom) / _entry
+            if lot_size > 0:
+                qty = _math.floor(qty / lot_size + 1e-9) * lot_size
+            sizing = _dc.replace(
+                sizing, quantity=round(qty, 10), notional_value=round(qty * _entry, 10),
+                risk_amount=round(qty * stop_distance, 10), capped=True,
+                cap_reason="gross_leverage_cap",
+            )
+            if qty <= 0:
+                return self._decision(
+                    signal.symbol, now_ms, RiskVerdict.REJECTED,
+                    RejectReason.RISK_EXPOSURE_EXCEEDED, checks,
+                    details={"open_notional": round(open_notional, 2),
+                             "max_gross": round(portfolio.equity * self._config.max_leverage, 2)},
+                )
+
         checks["position_sizing"] = sizing.quantity > 0
         if sizing.quantity <= 0:
             return self._decision(

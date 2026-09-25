@@ -7,6 +7,8 @@ trade buckets, candles, and freshness bookkeeping.
 from __future__ import annotations
 
 import time
+
+from crypto_scalper.core import clock
 from typing import Optional
 
 from crypto_scalper.core.models import AggTrade, DiffDepthEvent
@@ -60,4 +62,4 @@ class SymbolState:
         return now_ms - latest if latest > 0 else 10**9
 
     def utc_now_ms(self) -> int:
-        return int(time.time() * 1000)
+        return clock.now_ms()

@@ -125,7 +125,12 @@ def _snap(value: float, step: float, direction: str) -> float:
         return float(value)
     rounding = {"down": ROUND_FLOOR, "up": ROUND_CEILING}.get(direction, ROUND_HALF_UP)
     d_step = Decimal(str(step))
-    units = (Decimal(str(value)) / d_step).quantize(Decimal(1), rounding=rounding)
+    raw = Decimal(str(value)) / d_step
+    nearest = raw.quantize(Decimal(1), rounding=ROUND_HALF_UP)
+    if abs(raw - nearest) < Decimal("1e-9"):
+        units = nearest  # float noise (0.8999999999999999) is not a real remainder
+    else:
+        units = raw.quantize(Decimal(1), rounding=rounding)
     return float(units * d_step)
 
 

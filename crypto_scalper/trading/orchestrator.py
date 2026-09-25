@@ -40,7 +40,11 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-_FATAL_MARKERS = ("PositionNotProtectedError", "ProtectionTimeoutError")
+_FATAL_MARKERS = ("PositionNotProtectedError", "ProtectionTimeoutError",
+                  "ExchangeAuthenticationError")
+# Neutral (FLAT) signals arrive every second per symbol: keep one per window
+# for the dashboard instead of millions of identical audit rows per day.
+_FLAT_SIGNAL_SAMPLE_MS = 30_000
 
 
 def _is_fatal_error(error: Optional[str]) -> bool:
@@ -114,6 +118,10 @@ class TradeOrchestrator:
         self._trades_closed = 0
         self._closed: List[ManagedPosition] = []
         self._open_symbols: set = set()
+        self._inflight_symbols: set = set()
+        self._last_flat_saved: Dict[str, int] = {}
+        self._persisted: Dict[str, tuple] = {}
+        self.last_signal: Dict[str, dict] = {}
 
         self._pm.on_position_closed(self._record_close)
 
@@ -178,23 +186,37 @@ class TradeOrchestrator:
                         extra={"symbol": signal.symbol, "reason": self._pause_reason})
             return await self._blocked(signal, f"orchestrator_paused:{self._pause_reason}")
 
+        self.last_signal[signal.symbol] = {
+            "ts_ms": signal.timestamp_ms, "type": signal.signal_type.name,
+            "score": round(signal.score, 2), "regime": signal.regime,
+            "eligible": signal.eligible,
+        }
         per_symbol = self._config.max_open_per_symbol
-        if per_symbol and signal.symbol in self._open_symbols:
+        if per_symbol and self._symbol_busy(signal.symbol):
             METRICS.incr("paper.blocked_symbol_open")
-            return await self._blocked(signal, f"symbol_already_open:{signal.symbol}")
+            return await self._blocked(signal, f"symbol_already_open:{signal.symbol}",
+                                       persist=False)
 
         if signal.signal_type not in (SignalType.LONG, SignalType.SHORT):
             METRICS.incr("paper.blocked_flat")
-            return await self._blocked(signal, "flat_signal_not_eligible")
+            return await self._blocked(signal, "flat_signal_not_eligible",
+                                       persist=self._sample_flat(signal))
 
-        outcome = await self._router.route(signal, snapshot, self.build_portfolio())
+        # Claim the symbol BEFORE routing: a SL/TP fill racing inside open()
+        # must not leave the guard in a stale state.
+        self._inflight_symbols.add(signal.symbol)
+        try:
+            outcome = await self._router.route(signal, snapshot, self.build_portfolio())
+        finally:
+            self._inflight_symbols.discard(signal.symbol)
         await self._repo.save_risk_decision(outcome.decision)
         await self._repo.save_signal(
             signal, self._signal_block_reason(outcome),
         )
 
         if outcome.submitted and outcome.position is not None:
-            self._open_symbols.add(outcome.position.symbol)
+            if outcome.position.status is not PositionStatus.CLOSED:
+                self._open_symbols.add(outcome.position.symbol)
             METRICS.incr("paper.trades_opened")
         elif outcome.decision.verdict != RiskVerdict.APPROVED.name:
             METRICS.incr("paper.trades_rejected")
@@ -203,22 +225,82 @@ class TradeOrchestrator:
             self._pause(outcome.error)
         return outcome
 
+    def _symbol_busy(self, symbol: str) -> bool:
+        if symbol in self._inflight_symbols:
+            return True
+        return any(p.symbol == symbol for p in self._pm.open_positions())
+
+    def _sample_flat(self, signal: Signal) -> bool:
+        last = self._last_flat_saved.get(signal.symbol, 0)
+        if signal.timestamp_ms - last >= _FLAT_SIGNAL_SAMPLE_MS:
+            self._last_flat_saved[signal.symbol] = signal.timestamp_ms
+            return True
+        return False
+
+    # ── operator controls (dashboard) ────────────────────────────────────────
+
+    def pause(self, reason: str = "operator") -> None:
+        self._pause(reason)
+
+    def resume(self) -> None:
+        """Operator resume: clears the orchestrator pause and the PM halt."""
+        self._paused = False
+        self._pause_reason = ""
+        reset = getattr(self._pm, "reset_halt", None)
+        if callable(reset):
+            reset()
+        log.warning("orchestrator resumed by operator")
+
+    async def flatten_all(self, reason: str = "operator_flatten") -> int:
+        closed = 0
+        for pos in list(self._pm.open_positions()):
+            try:
+                await self._pm.close_position(pos.position_id, reason=reason)
+                closed += 1
+            except Exception:  # noqa: BLE001
+                log.exception("flatten failed", extra={"position_id": pos.position_id})
+        return closed
+
     async def on_price(self, symbol: str, price: float) -> None:
         """Push a market tick into the venue, let fills settle, mark to market."""
-        self._router.update_price(symbol, price)
-        await asyncio.sleep(0)
+        if self._router.update_price(symbol, price):
+            # the simulator emitted fills: give the PositionManager consumer a
+            # few loop turns to process them before the next decision
+            for _ in range(3):
+                await asyncio.sleep(0)
         self.build_portfolio()
 
-    async def persist(self) -> None:
-        """Persist the current positions/orders/fills for audit (idempotent)."""
-        if self._om is not None:
+    async def persist(self, *, refresh: bool = True) -> None:
+        """Persist what changed since the last pass (idempotent upserts).
+
+        Rewriting every position/order ever seen on each tick grows O(N) and
+        blocks the loop; a cheap signature per object skips unchanged rows.
+        Open positions are always re-saved so their unrealized PnL stays live.
+        """
+        if self._om is not None and refresh:
             await self._om.refresh()
         for pos in self._pm.positions():
-            await self._repo.save_position(pos)
+            sig = (pos.status, pos.quantity, pos.entry_price, pos.stop_loss_price,
+                   pos.take_profit_price, pos.realized_pnl, pos.closed_ts_ms)
+            is_open = pos.status in (PositionStatus.ENTRY_FILLED, PositionStatus.PROTECTING,
+                                     PositionStatus.ACTIVE)
+            key = f"pos:{pos.position_id}"
+            if is_open or self._persisted.get(key) != sig:
+                await self._repo.save_position(pos)
+                self._persisted[key] = sig
         if self._om is not None:
             for report in self._om.orders():
+                key = f"ord:{report.client_order_id}"
+                sig = (report.status, report.executed_quantity, len(report.fills))
+                if self._persisted.get(key) == sig:
+                    continue
                 await self._repo.save_order(report)
                 await self._repo.save_fills(report.fills)
+                self._persisted[key] = sig
+        if len(self._persisted) > 5000:
+            live = {f"pos:{p.position_id}" for p in self._pm.positions()}
+            live |= {f"ord:{r.client_order_id}" for r in (self._om.orders() if self._om else ())}
+            self._persisted = {k: v for k, v in self._persisted.items() if k in live}
 
     # ── accounting hooks ─────────────────────────────────────────────────────
 
@@ -246,8 +328,9 @@ class TradeOrchestrator:
 
     # ── bookkeeping pass-through ─────────────────────────────────────────────
 
-    async def _blocked(self, signal: Signal, reason: str) -> ExecutionOutcome:
-        await self._repo.save_signal(signal, rejection_reason=reason)
+    async def _blocked(self, signal: Signal, reason: str, persist: bool = True) -> ExecutionOutcome:
+        if persist:
+            await self._repo.save_signal(signal, rejection_reason=reason)
         return ExecutionOutcome(
             submitted=False,
             decision=self._blocked_decision(signal, reason),

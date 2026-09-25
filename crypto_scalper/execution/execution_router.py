@@ -95,7 +95,10 @@ class ExecutionRouter:
         portfolio: PortfolioState,
     ) -> ExecutionOutcome:
         """Risk first. If approved, open and protect; otherwise stay put."""
-        sym_filters = self.filters.get(signal.symbol) if self.filters is not None else None
+        # Only symbols with filters loaded from exchangeInfo are snapped; unit
+        # tests and ad-hoc symbols keep the legacy tick/lot defaults.
+        sym_filters = (self.filters.get(signal.symbol)
+                       if self.filters is not None and signal.symbol in self.filters else None)
         decision = self._risk.assess(
             signal,
             portfolio,
@@ -203,20 +206,47 @@ def build_execution_stack(
     run_mode: str,
     settings: Settings,
     risk_engine: RiskEngine,
+    *,
+    venue: Optional[str] = None,
+    filters: Optional[FilterRegistry] = None,
+    symbols: Optional[list] = None,
+    price_source=None,
 ) -> Tuple[ExchangeAdapter, OrderManager, PositionManager, ExecutionRouter]:
-    """Assemble the offline execution stack for a run mode.
+    """Assemble the execution stack.
 
-    FASE 6: every mode except LIVE uses the simulated adapter. LIVE refuses
-    to build until a real Binance futures adapter exists.
+    ``venue`` = "paper" (simulator, default) or "testnet" (Binance demo futures
+    with real orders on a trial account). Real-money LIVE is deliberately not
+    buildable from here.
     """
     config = settings.execution
     if run_mode.lower() == "live":
         raise NotImplementedError(
-            "live execution is not available in FASE 6; "
-            "create LIVE_TRADING_ENABLED=false and a paper/simulated run"
+            "real-money live execution is disabled; use EXECUTION_VENUE=testnet"
         )
+    filters = filters if filters is not None else FilterRegistry()
+    venue = (venue or "paper").lower()
 
-    adapter: ExchangeAdapter = SimulatedExecutionAdapter(config)
+    if venue == "testnet":
+        from crypto_scalper.execution.binance_client import BinanceFuturesClient
+        from crypto_scalper.execution.binance_futures import BinanceFuturesAdapter
+
+        vc = settings.venue
+        client = BinanceFuturesClient(
+            vc.testnet_rest_url, vc.api_key, vc.api_secret,
+            recv_window_ms=vc.recv_window_ms,
+        )
+        adapter: ExchangeAdapter = BinanceFuturesAdapter(
+            client,
+            ws_base_url=vc.testnet_ws_url,
+            config=config,
+            filters=filters,
+            symbols=list(symbols or settings.explicit_symbols or []),
+            leverage=settings.risk.max_leverage,
+            price_source=price_source,
+            poll_interval_s=vc.poll_interval_s,
+        )
+    else:
+        adapter = SimulatedExecutionAdapter(config)
     order_manager = OrderManager(adapter, config)
     position_manager = PositionManager(order_manager, config)
     router = ExecutionRouter(
@@ -225,6 +255,7 @@ def build_execution_stack(
         adapter,
         rr_ratio=config.default_rr_ratio,
         sl_atr_mult=config.default_sl_atr_mult,
+        filters=filters,   # shared: the testnet adapter fills it on start()
     )
     return adapter, order_manager, position_manager, router
 

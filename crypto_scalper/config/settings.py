@@ -12,6 +12,7 @@ from crypto_scalper.config.monitoring import MonitoringConfig
 from crypto_scalper.config.paper import PaperConfig
 from crypto_scalper.config.risk import RiskConfig
 from crypto_scalper.config.strategies import DEFAULT_SIGNAL_WEIGHTS, StrategyConfig
+from crypto_scalper.config.venue import ServerConfig, VenueConfig
 from crypto_scalper.core.enums import Environment, Regime
 from crypto_scalper.core.exceptions import ConfigurationError
 
@@ -20,9 +21,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 def _load_dotenv_for_environment() -> None:
     """Loads .env then the environment-specific override file (.env.<APP_ENV>)."""
-    app_env = os.environ.get("APP_ENV", "dev")
+    # .env first: APP_ENV may itself be defined there.
     load_dotenv(PROJECT_ROOT / ".env", override=False)
+    app_env = os.environ.get("APP_ENV", "dev")
     load_dotenv(PROJECT_ROOT / f".env.{app_env}", override=False)
+
+
+def _as_path(name: str, default: str) -> Path:
+    """Relative paths resolve against the project root, never the CWD, so the
+    bot and the dashboard always agree on the same files."""
+    p = Path(_as_str(name, default)).expanduser()
+    return p if p.is_absolute() else PROJECT_ROOT / p
 
 
 def _as_float(name: str, default: float) -> float:
@@ -117,6 +126,8 @@ class Settings:
     paper: PaperConfig = field(default_factory=PaperConfig)
     backtest: BacktestConfig = field(default_factory=BacktestConfig)
     monitoring: MonitoringConfig = field(default_factory=MonitoringConfig)
+    venue: VenueConfig = field(default_factory=VenueConfig)
+    server: ServerConfig = field(default_factory=ServerConfig)
 
     @classmethod
     def load(cls) -> "Settings":
@@ -169,7 +180,7 @@ class Settings:
             data=DataConfig(),
             log_level=_as_str("LOG_LEVEL", "INFO").upper(),
             log_format=_as_str("LOG_FORMAT", "kv"),
-            log_dir=Path(_as_str("LOG_DIR", "logs")),
+            log_dir=_as_path("LOG_DIR", "logs"),
             explicit_symbols=explicit,
             strategies=_load_strategy_config(),
             execution=ExecutionConfig(
@@ -183,6 +194,26 @@ class Settings:
                 event_queue_size=_as_int("EXECUTION_EVENT_QUEUE_SIZE", 1000),
                 default_rr_ratio=_as_float("EXECUTION_DEFAULT_RR_RATIO", 2.0),
                 default_sl_atr_mult=_as_float("EXECUTION_DEFAULT_SL_ATR_MULT", 1.5),
+                fee_pct=_as_float("EXECUTION_FEE_PCT", 0.0004),
+                loss_streak_cooldown_s=_as_float("RISK_LOSS_STREAK_COOLDOWN_S", 1800.0),
+                entry_fill_timeout_s=_as_float("EXECUTION_ENTRY_FILL_TIMEOUT_S", 5.0),
+            ),
+            venue=VenueConfig(
+                venue=_as_str("EXECUTION_VENUE", "paper").lower(),
+                testnet_rest_url=_as_str("BINANCE_TESTNET_REST_URL", "https://demo-fapi.binance.com"),
+                testnet_ws_url=_as_str("BINANCE_TESTNET_WS_URL", "wss://demo-fstream.binance.com"),
+                api_key=_as_str("BINANCE_TESTNET_API_KEY", ""),
+                api_secret=_as_str("BINANCE_TESTNET_API_SECRET", ""),
+                recv_window_ms=_as_int("BINANCE_RECV_WINDOW_MS", 5000),
+                poll_interval_s=_as_float("BINANCE_POLL_INTERVAL_S", 2.0),
+                fallback_to_paper=_as_bool("TESTNET_FALLBACK_TO_PAPER", True),
+            ),
+            server=ServerConfig(
+                enabled=_as_bool("HTTP_ENABLED", True),
+                host=_as_str("HTTP_HOST", "0.0.0.0"),
+                port=_as_int("PORT", 8080),
+                control_token=_as_str("DASHBOARD_CONTROL_TOKEN", ""),
+                dashboard_password=_as_str("DASHBOARD_PASSWORD", ""),
             ),
             risk=_load_risk_config(),
             paper=_load_paper_config(),
@@ -252,7 +283,7 @@ def _load_paper_config() -> PaperConfig:
         reconcile_interval_s=_as_float("PAPER_RECONCILE_INTERVAL_S", 60.0),
         summary_interval_s=_as_float("PAPER_SUMMARY_INTERVAL_S", 30.0),
         max_open_per_symbol=_as_int("PAPER_MAX_OPEN_PER_SYMBOL", 1),
-        db_path=Path(_as_str("PAPER_DB_PATH", "logs/paper.db")),
+        db_path=_as_path("PAPER_DB_PATH", "logs/paper.db"),
     )
 
 
@@ -261,7 +292,7 @@ def _load_backtest_config() -> BacktestConfig:
     from crypto_scalper.config.backtest import CostModelConfig
 
     return BacktestConfig(
-        data_dir=Path(_as_str("BACKTEST_DATA_DIR", "data/klines")),
+        data_dir=_as_path("BACKTEST_DATA_DIR", "data/klines"),
         interval_s=_as_int("BACKTEST_INTERVAL_S", 60),
         warmup_bars=_as_int("BACKTEST_WARMUP_BARS", 60),
         fill_at=_as_str("BACKTEST_FILL_AT", "close").lower(),
@@ -278,7 +309,7 @@ def _load_backtest_config() -> BacktestConfig:
             minimum_required_edge_pct=_as_float("COST_MIN_EDGE_PCT", 0.0015),
         ),
         db_path=_as_str("BACKTEST_DB_PATH", ""),
-        model_path=Path(_as_str("BACKTEST_MODEL_PATH", "models/ml-predictor.joblib")),
+        model_path=_as_path("BACKTEST_MODEL_PATH", "models/ml-predictor.joblib"),
     )
 
 

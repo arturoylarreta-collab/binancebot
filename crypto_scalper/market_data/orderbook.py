@@ -69,9 +69,18 @@ class OrderBook:
         self._diff_buffer.clear()
 
     def begin_resync(self) -> None:
-        """Drop the (inconsistent) book and buffer diffs until the next snapshot."""
+        """Drop the (inconsistent) book and buffer diffs until the next snapshot.
+
+        Already-buffered diffs are KEPT: a REST snapshot can lag the stream, and
+        those diffs are exactly what bridges it (stale ones are dropped on replay).
+        """
         self.resyncs += 1
-        self.clear()
+        self._bids.clear()
+        self._asks.clear()
+        self._last_update_id = 0
+        self._has_snapshot = False
+        self._first_applied = False
+        self.sync_required = True
 
     def apply_snapshot(
         self,

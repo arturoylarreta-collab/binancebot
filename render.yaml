@@ -1,0 +1,50 @@
+# Render Blueprint — one always-on web service: the bot + its dashboard.
+# Secrets (sync: false) are entered by you in the Render dashboard, never here.
+services:
+  - type: web
+    name: crypto-scalper
+    runtime: docker
+    region: frankfurt          # Binance blocks US IPs (HTTP 451)
+    plan: starter              # always-on; the free plan sleeps after 15 min
+    branch: main
+    autoDeploy: true
+    healthCheckPath: /healthz
+    disk:
+      name: bot-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: EXECUTION_VENUE
+        value: testnet         # falls back to paper until the keys exist
+      - key: SYMBOLS
+        value: BTCUSDT,ETHUSDT,SOLUSDT
+      - key: PAPER_DB_PATH
+        value: /var/data/bot.db
+      - key: PAPER_START_EQUITY
+        value: "10000"
+      - key: RISK_MAX_RISK_PER_TRADE_PCT
+        value: "0.005"
+      - key: RISK_MIN_STOP_PCT
+        value: "0.0025"
+      - key: RISK_MAX_LEVERAGE
+        value: "2"
+      - key: EXECUTION_DEFAULT_RR_RATIO
+        value: "1.8"
+      - key: STRATEGY_LONG_THRESHOLD
+        value: "58"
+      - key: STRATEGY_SHORT_THRESHOLD
+        value: "42"
+      - key: LOG_FORMAT
+        value: kv
+      - key: BINANCE_TESTNET_API_KEY
+        sync: false
+      - key: BINANCE_TESTNET_API_SECRET
+        sync: false
+      - key: DASHBOARD_PASSWORD
+        sync: false
+      - key: DASHBOARD_CONTROL_TOKEN
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false

@@ -672,7 +672,7 @@ class PositionManager:
         sign = 1.0 if pos.side == "BUY" else -1.0
         pos.stop_loss_price = pos.entry_price - sign * sl_dist
         pos.take_profit_price = pos.entry_price + sign * tp_dist
-        if self.filters is not None:
+        if self.filters is not None and pos.symbol in self.filters:
             f = self.filters.get(pos.symbol)
             # stop rounds AWAY from entry (keeps at least the approved distance),
             # TP rounds TOWARD entry (stays reachable).

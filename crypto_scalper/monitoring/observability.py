@@ -88,6 +88,7 @@ class ObservabilityRepository(Repository):
         self._position_status: Dict[str, str] = {}
         self._halt_last_ts: Dict[str, int] = {}
         self._last_heartbeat_ts_ms: int = 0
+        self._equity_fn: Optional[Callable[[], Dict[str, Any]]] = None
 
     # ── wiring (duck-typed desde los engines, sin imports cruzados) ─────────
 
@@ -96,6 +97,19 @@ class ObservabilityRepository(Repository):
 
     def set_mode(self, mode: str) -> None:
         self._mode = mode
+
+    def attach_equity(self, fn: Callable[[], Dict[str, Any]]) -> None:
+        """Authoritative account figures (PaperAccount net of fees, or the
+        venue wallet on testnet) instead of re-deriving them from the DB."""
+        self._equity_fn = fn
+
+    def set_start_equity(self, value: float) -> None:
+        self._start_equity = float(value)
+        self._peak_equity = max(self._peak_equity, float(value)) if self._equity_fn else float(value)
+
+    async def tick(self) -> None:
+        """Heartbeat independent of trading activity (throttled)."""
+        await self._maybe_heartbeat()
 
     @property
     def inner(self) -> Repository:
@@ -254,6 +268,16 @@ class ObservabilityRepository(Repository):
             exposure += float(p.notional_value or 0.0)
 
         equity = self._start_equity + realized_total + unrealized_total
+        status = "running"
+        if self._equity_fn is not None:
+            try:
+                acct = self._equity_fn()
+                equity = float(acct.get("equity", equity))
+                realized_total = float(acct.get("realized_pnl", realized_total))
+                unrealized_total = float(acct.get("unrealized_pnl", unrealized_total))
+                status = str(acct.get("status", status))
+            except Exception:  # noqa: BLE001 - heartbeat nunca debe romper el loop
+                log.warning("equity source failed", exc_info=True)
         self._peak_equity = max(self._peak_equity, equity)
         dd = 0.0
         if self._peak_equity > 0:
@@ -262,7 +286,7 @@ class ObservabilityRepository(Repository):
         return HeartbeatSnapshot(
             ts_ms=now_ms,
             mode=self._mode,
-            status="running",
+            status=status,
             equity=round(equity, 6),
             realized_pnl=round(realized_total, 6),
             unrealized_pnl=round(unrealized_total, 6),
