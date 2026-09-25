@@ -21,33 +21,48 @@ from crypto_scalper.core.exceptions import (
 
 
 class RateLimiter:
-    """Token-bucket rate limiter keyed on Binance request weight."""
+    """Continuous token bucket keyed on Binance request weight.
+
+    Refills at ``capacity/60`` tokens per second up to ``capacity`` (the old
+    queue-based version only refilled when EMPTY, so the burst allowance was
+    gone after the first minute). ``block_for`` honours ``Retry-After``.
+    """
 
     def __init__(self, capacity_per_minute: int = 2400) -> None:
-        self._capacity = capacity_per_minute
-        self._queue: asyncio.Queue = asyncio.Queue(maxsize=capacity_per_minute)
+        self._capacity = float(capacity_per_minute)
+        self._tokens = float(capacity_per_minute)
+        self._rate = capacity_per_minute / 60.0
+        self._last = 0.0
+        self._blocked_until = 0.0
+        self._lock: Optional[asyncio.Lock] = None
+        self._refiller = None
 
     async def start(self) -> None:
-        for _ in range(self._capacity):
-            self._queue.put_nowait(1.0)
-        self._refiller = asyncio.create_task(self._refill())
+        self._lock = asyncio.Lock()
+        self._last = asyncio.get_running_loop().time()
 
-    async def _refill(self) -> None:
-        try:
-            while True:
-                await asyncio.sleep(60.0 / self._capacity)
-                if self._queue.empty():
-                    self._queue.put_nowait(1.0)
-        except asyncio.CancelledError:
-            pass
+    def block_for(self, seconds: float) -> None:
+        loop_t = asyncio.get_running_loop().time()
+        self._blocked_until = max(self._blocked_until, loop_t + max(0.0, seconds))
 
     async def acquire(self, weight: int = 1) -> None:
-        for _ in range(weight):
-            await self._queue.get()
+        assert self._lock is not None, "RateLimiter.start() not called"
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            while True:
+                now = loop.time()
+                if now < self._blocked_until:
+                    await asyncio.sleep(self._blocked_until - now)
+                    continue
+                self._tokens = min(self._capacity, self._tokens + (now - self._last) * self._rate)
+                self._last = now
+                if self._tokens >= weight:
+                    self._tokens -= weight
+                    return
+                await asyncio.sleep((weight - self._tokens) / self._rate)
 
     async def close(self) -> None:
-        if self._refiller:
-            self._refiller.cancel()
+        return None
 
 
 _DEPTH_WEIGHTS = {5: 2, 10: 2, 20: 5, 50: 5, 100: 10, 500: 20, 1000: 20}
@@ -98,7 +113,13 @@ class BinanceFuturesRest:
         try:
             async with self._session.get(url, params=params) as resp:
                 if resp.status == 429 or resp.status == 418:
-                    raise ExchangeRateLimitError(f"rate limited GET {path}: {resp.status}")
+                    # 418 = temporary IP ban (common on shared cloud egress IPs):
+                    # stop ALL requests for Retry-After instead of digging deeper.
+                    retry_after = float(resp.headers.get("Retry-After") or
+                                        (30.0 if resp.status == 418 else 5.0))
+                    self._limiter.block_for(min(retry_after, 300.0))
+                    raise ExchangeRateLimitError(
+                        f"rate limited GET {path}: {resp.status} retry_after={retry_after}s")
                 if resp.status == 403:
                     raise ExchangeConnectionError(f"forbidden GET {path}: {resp.status}")
                 if resp.status >= 400:

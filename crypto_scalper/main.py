@@ -323,12 +323,18 @@ async def run_paper(settings: Settings, args: argparse.Namespace) -> int:
                 runtime.note("testnet preflight OK: API keys válidas")
 
         filters = FilterRegistry()
-        try:
-            # Real exchange grid even on paper, so paper sizing == testnet sizing.
-            filters = FilterRegistry.from_exchange_info(
-                {"symbols": await rest.exchange_info()}, symbols)
-        except Exception as exc:  # noqa: BLE001 - paper can fall back to defaults
-            log.warning("exchange filters unavailable", extra={"error": repr(exc)})
+        for attempt in range(4):
+            try:
+                # Real exchange grid even on paper, so paper sizing == testnet sizing.
+                filters = FilterRegistry.from_exchange_info(
+                    {"symbols": await rest.exchange_info()}, symbols)
+                break
+            except Exception as exc:  # noqa: BLE001 - paper can fall back to defaults
+                log.warning("exchange filters unavailable",
+                            extra={"error": repr(exc), "attempt": attempt})
+                await asyncio.sleep(2.0 * (attempt + 1))
+        if not len(filters):
+            runtime.note("filtros del exchange no disponibles: redondeo por defecto")
 
         mirror = await _start_mirror(settings, venue, runtime)
 
