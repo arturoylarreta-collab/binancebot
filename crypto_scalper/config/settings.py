@@ -12,7 +12,7 @@ from crypto_scalper.config.monitoring import MonitoringConfig
 from crypto_scalper.config.paper import PaperConfig
 from crypto_scalper.config.risk import RiskConfig
 from crypto_scalper.config.strategies import DEFAULT_SIGNAL_WEIGHTS, StrategyConfig
-from crypto_scalper.config.venue import ServerConfig, VenueConfig
+from crypto_scalper.config.venue import DurabilityConfig, ServerConfig, VenueConfig
 from crypto_scalper.core.enums import Environment, Regime
 from crypto_scalper.core.exceptions import ConfigurationError
 
@@ -128,6 +128,7 @@ class Settings:
     monitoring: MonitoringConfig = field(default_factory=MonitoringConfig)
     venue: VenueConfig = field(default_factory=VenueConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
+    durability: DurabilityConfig = field(default_factory=DurabilityConfig)
 
     @classmethod
     def load(cls) -> "Settings":
@@ -207,6 +208,15 @@ class Settings:
                 recv_window_ms=_as_int("BINANCE_RECV_WINDOW_MS", 5000),
                 poll_interval_s=_as_float("BINANCE_POLL_INTERVAL_S", 2.0),
                 fallback_to_paper=_as_bool("TESTNET_FALLBACK_TO_PAPER", True),
+            ),
+            durability=DurabilityConfig(
+                firebase_service_account=_as_str("FIREBASE_SERVICE_ACCOUNT_JSON", ""),
+                bot_id=_as_str("FIRESTORE_BOT_ID", ""),
+                equity_interval_s=_as_float("FIRESTORE_EQUITY_INTERVAL_S", 300.0),
+                flush_interval_s=_as_float("FIRESTORE_FLUSH_INTERVAL_S", 15.0),
+                flatten_paper_on_shutdown=_as_bool("PAPER_FLATTEN_ON_SHUTDOWN", True),
+                keepalive_url=_as_str("KEEPALIVE_URL", _as_str("RENDER_EXTERNAL_URL", "")),
+                keepalive_interval_s=_as_float("KEEPALIVE_INTERVAL_S", 600.0),
             ),
             server=ServerConfig(
                 enabled=_as_bool("HTTP_ENABLED", True),

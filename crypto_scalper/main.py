@@ -293,6 +293,7 @@ async def run_paper(settings: Settings, args: argparse.Namespace) -> int:
     )
 
     runner = None
+    mirror = None
     md: Optional[_MarketData] = None
     engine: Optional[PaperTradingEngine] = None
     tasks: dict = {}
@@ -329,6 +330,8 @@ async def run_paper(settings: Settings, args: argparse.Namespace) -> int:
         except Exception as exc:  # noqa: BLE001 - paper can fall back to defaults
             log.warning("exchange filters unavailable", extra={"error": repr(exc)})
 
+        mirror = await _start_mirror(settings, venue, runtime)
+
         md = _MarketData(settings, rest, symbols, stop_event)
         runtime.states = md.states
         runtime.ws_manager = md.ws
@@ -343,7 +346,11 @@ async def run_paper(settings: Settings, args: argparse.Namespace) -> int:
             price_source=md.latest_price,
             runtime=runtime,
             max_snapshot_age_ms=int(max(5.0, 5 * settings.features.interval_s) * 1000),
+            mirror=mirror,
+            flatten_on_shutdown=settings.durability.flatten_paper_on_shutdown,
         )
+        if mirror is not None:
+            await _restore_from_mirror(mirror, engine, repository, venue, runtime)
         await md.start()
         if notifier is not None:
             await notifier.start()
@@ -353,6 +360,12 @@ async def run_paper(settings: Settings, args: argparse.Namespace) -> int:
             "ws": md.tasks[0],
         }
         metrics_task = asyncio.create_task(_metrics_summary(stop_event, rest), name="metrics")
+        keepalive_task = None
+        if settings.durability.keepalive_url:
+            keepalive_task = asyncio.create_task(
+                _keepalive(settings.durability.keepalive_url,
+                           settings.durability.keepalive_interval_s, stop_event),
+                name="keepalive")
         log.info("trading pipeline ready",
                  extra={"venue": venue, "symbols": ",".join(symbols),
                         "equity": settings.paper.start_equity,
@@ -361,6 +374,8 @@ async def run_paper(settings: Settings, args: argparse.Namespace) -> int:
         runtime.note(f"arranque: venue={venue} símbolos={','.join(symbols)}")
         rc = await _supervise(tasks, stop_event)
         metrics_task.cancel()
+        if keepalive_task is not None:
+            keepalive_task.cancel()
     except Exception:  # noqa: BLE001 - startup failure must exit non-zero
         log.exception("trading pipeline failed to start")
         rc = 1
@@ -379,9 +394,103 @@ async def run_paper(settings: Settings, args: argparse.Namespace) -> int:
         if md is not None:
             await md.close()
         await rest.close()
+        if mirror is not None:
+            await mirror.close()
         if runner is not None:
             await runner.cleanup()
     return rc
+
+
+async def _start_mirror(settings: Settings, venue: str, runtime):
+    """Firestore (Firebase Spark) durable mirror; None when not configured."""
+    dur = settings.durability
+    if not dur.firestore_enabled:
+        return None
+    from crypto_scalper.storage.firestore_mirror import FirestoreMirror
+
+    mirror = FirestoreMirror.from_env(
+        dur.firebase_service_account, bot_id=dur.bot_id or venue,
+        equity_interval_s=dur.equity_interval_s, flush_interval_s=dur.flush_interval_s)
+    if mirror is None:
+        runtime.note("Firestore: credenciales inválidas; sin persistencia durable")
+        return None
+    try:
+        await mirror.start()
+    except Exception as exc:  # noqa: BLE001 - durability is optional, trading is not
+        log.error("firestore unavailable", extra={"error": repr(exc)})
+        runtime.note(f"Firestore no disponible: {type(exc).__name__}")
+        await mirror.close(timeout_s=1.0)
+        return None
+    runtime.mirror = mirror
+    return mirror
+
+
+async def _restore_from_mirror(mirror, engine, repository, venue: str, runtime) -> None:
+    """Resume account + history after a restart on an ephemeral filesystem."""
+    from crypto_scalper.core.enums import PositionStatus
+    from crypto_scalper.core.models import HeartbeatSnapshot, ManagedPosition
+
+    try:
+        state = await mirror.load_state()
+        if state:
+            engine.restore_state(state)
+        inner = getattr(repository, "inner", repository)
+        if hasattr(inner, "count_rows") and inner.count_rows("positions") == 0:
+            since = int(time.time() * 1000) - 7 * 86_400_000
+            trades = await mirror.load_collection("trades", order_field="closed_ts_ms",
+                                                  since=since, limit=500)
+            for t in trades:
+                await inner.save_position(ManagedPosition(
+                    position_id=t["position_id"], symbol=t["symbol"], side=t["side"],
+                    quantity=float(t["quantity"]), ordered_quantity=float(t["quantity"]),
+                    entry_price=float(t["entry_price"]),
+                    stop_loss_price=float(t.get("stop_loss_price", 0.0)),
+                    take_profit_price=float(t.get("take_profit_price", 0.0)),
+                    notional_value=float(t.get("notional_value", 0.0)),
+                    risk_amount=float(t.get("risk_amount", 0.0)),
+                    regime=str(t.get("regime", "")), status=PositionStatus.CLOSED,
+                    entry_client_order_id=f"ENTRY-{t['position_id'].upper()}",
+                    opened_ts_ms=int(t.get("opened_ts_ms", 0)),
+                    closed_ts_ms=int(t.get("closed_ts_ms", 0)),
+                    realized_pnl=float(t.get("realized_pnl", 0.0)),
+                    close_reason=str(t.get("close_reason", "")),
+                    fees=float(t.get("fees", 0.0)), exit_price=float(t.get("exit_price", 0.0)),
+                ))
+            points = await mirror.load_collection("equity", order_field="ts_ms",
+                                                  since=since, limit=2100)
+            for p in points:
+                await inner.save_heartbeat(HeartbeatSnapshot(
+                    ts_ms=int(p["ts_ms"]), mode=venue, status="restored",
+                    equity=float(p["equity"]), realized_pnl=float(p.get("realized", 0.0)),
+                    unrealized_pnl=float(p.get("unrealized", 0.0)),
+                    drawdown_pct=float(p.get("drawdown_pct", 0.0)), total_exposure=0.0,
+                    open_count=int(p.get("open_count", 0)), trades_today=0, uptime_ms=0))
+            runtime.note(f"restaurado de Firestore: {len(trades)} trades, {len(points)} puntos de equity")
+        elif state:
+            runtime.note("estado restaurado de Firestore")
+    except Exception as exc:  # noqa: BLE001 - a failed restore must not block trading
+        log.exception("firestore restore failed")
+        runtime.note(f"restauración Firestore falló: {type(exc).__name__}")
+
+
+async def _keepalive(url: str, interval_s: float, stop_event: asyncio.Event) -> None:
+    """Self-ping the public URL so free hosts that idle-sleep keep the bot up."""
+    import aiohttp
+
+    target = url.rstrip("/") + "/healthz"
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval_s)
+                return
+            except asyncio.TimeoutError:
+                pass
+            try:
+                async with session.get(target) as resp:
+                    METRICS.incr("keepalive.ok" if resp.status < 500 else "keepalive.bad")
+            except Exception as exc:  # noqa: BLE001
+                METRICS.incr("keepalive.error")
+                log.debug("keepalive failed", extra={"error": repr(exc)})
 
 
 async def _run_engine_guarded(

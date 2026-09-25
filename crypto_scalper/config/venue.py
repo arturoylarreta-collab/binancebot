@@ -57,6 +57,24 @@ class VenueConfig:
 
 
 @dataclass(frozen=True)
+class DurabilityConfig:
+    """State that must outlive an ephemeral container (e.g. Render Free)."""
+    firebase_service_account: str = field(default="", repr=False)
+    bot_id: str = ""                    # Firestore doc id; default = venue
+    equity_interval_s: float = 300.0
+    flush_interval_s: float = 15.0
+    # Realize simulated positions at the last price on SIGTERM (paper only).
+    flatten_paper_on_shutdown: bool = True
+    # Ping this URL's /healthz so free hosts that sleep on inactivity stay up.
+    keepalive_url: str = ""
+    keepalive_interval_s: float = 600.0
+
+    @property
+    def firestore_enabled(self) -> bool:
+        return bool(self.firebase_service_account)
+
+
+@dataclass(frozen=True)
 class ServerConfig:
     """Embedded HTTP server: /healthz, JSON API and the web dashboard."""
     enabled: bool = True

@@ -58,7 +58,11 @@ class PaperTradingEngine:
         price_source: Optional[Callable[[str], Optional[float]]] = None,
         runtime: Optional[RuntimeState] = None,
         max_snapshot_age_ms: Optional[int] = None,
+        mirror=None,
+        flatten_on_shutdown: bool = False,
     ) -> None:
+        self._mirror = mirror
+        self._flatten_on_shutdown = flatten_on_shutdown
         self._settings = settings
         self._signals = signal_engine
         self._source = source
@@ -98,6 +102,8 @@ class PaperTradingEngine:
         )
         self._runtime.orchestrator = self._orchestrator
         self._runtime.adapter = adapter
+        if self._mirror is not None:
+            pm.on_position_closed(self._mirror_trade)
         self._wire_observability()
         self._stop_event = asyncio.Event()
 
@@ -143,6 +149,7 @@ class PaperTradingEngine:
         loop = asyncio.get_running_loop()
         summary_s = self._settings.paper.summary_interval_s
         last_summary = last_persist = last_prune = last_retention = loop.time()
+        last_state = last_equity = 0.0
         consecutive_errors = 0
         self._runtime.engine_alive = True
         try:
@@ -167,6 +174,13 @@ class PaperTradingEngine:
                 if now - last_persist >= _PERSIST_EVERY_S or reached:
                     await self._orchestrator.persist(refresh=self._venue == "paper")
                     last_persist = now
+                if self._mirror is not None:
+                    if now - last_state >= 60.0:
+                        self._mirror.put_state(self.export_state())
+                        last_state = now
+                    if now - last_equity >= self._mirror.equity_interval_s:
+                        self._mirror_equity()
+                        last_equity = now
                 if now - last_prune >= _PRUNE_EVERY_S:
                     self._pm.prune_closed()
                     last_prune = now
@@ -183,6 +197,18 @@ class PaperTradingEngine:
                     last_summary = now
         finally:
             self._runtime.engine_alive = False
+            if self._flatten_on_shutdown and self._venue == "paper":
+                # Simulated positions cannot survive a restart: realize them at
+                # the last price so the resumed account keeps their PnL.
+                try:
+                    closed = await self._orchestrator.flatten_all("shutdown")
+                    if closed:
+                        log.info("paper positions closed on shutdown", extra={"count": closed})
+                except Exception:  # noqa: BLE001
+                    log.exception("shutdown flatten failed")
+            if self._mirror is not None:
+                self._mirror.put_state(self.export_state())
+                self._mirror_equity()
             try:
                 await self._orchestrator.persist(refresh=False)
             except Exception:  # noqa: BLE001
@@ -236,6 +262,73 @@ class PaperTradingEngine:
 
     def stop(self) -> None:
         self._stop_event.set()
+
+    # ── durable state (FirestoreMirror) ──────────────────────────────────────
+
+    def export_state(self) -> dict:
+        acct = self._account
+        s = self._orchestrator.summary()
+        return {
+            "venue": self._venue,
+            "start_equity": acct.start_equity,
+            "cash": acct.cash,
+            "realized_pnl": acct.realized_pnl,
+            "fees_paid": acct.fees_paid,
+            "peak_equity": acct.peak_equity,
+            "equity": s.equity,
+            "trades_closed": self._orchestrator.trades_closed,
+            "daily_realized_pnl": self._pm.daily_realized_pnl,
+            "day": getattr(self._pm, "_day", ""),
+            "consecutive_losses": self._pm.consecutive_losses,
+            "last_loss_ms": getattr(self._pm, "_last_loss_ms", 0),
+        }
+
+    def restore_state(self, state: dict) -> None:
+        """Resume counters (and, on paper, the whole account) from a mirror."""
+        if not state:
+            return
+        if self._venue == "paper" and state.get("venue", "paper") == "paper":
+            self._account.restore(
+                cash=float(state.get("cash", self._account.cash)),
+                realized_pnl=float(state.get("realized_pnl", 0.0)),
+                fees_paid=float(state.get("fees_paid", 0.0)),
+                peak_equity=float(state.get("peak_equity", self._account.peak_equity)),
+                start_equity=float(state.get("start_equity", 0.0)),
+            )
+            peak = getattr(self._repo, "set_peak_equity", None)
+            if callable(peak):
+                peak(float(state.get("peak_equity", 0.0)))
+            start = getattr(self._repo, "set_start_equity", None)
+            if callable(start):
+                start(float(state.get("start_equity", self._account.start_equity)))
+        self._orchestrator._trades_closed = int(state.get("trades_closed", 0))
+        if state.get("day") == getattr(self._pm, "_day", None):
+            self._pm._daily_realized_pnl = float(state.get("daily_realized_pnl", 0.0))
+        self._pm._consecutive_losses = int(state.get("consecutive_losses", 0))
+        self._pm._last_loss_ms = int(state.get("last_loss_ms", 0))
+        log.info("session state restored", extra={
+            "cash": round(self._account.cash, 2), "trades": self._orchestrator.trades_closed})
+
+    def _mirror_trade(self, pos) -> None:
+        try:
+            self._mirror.put_trade({
+                "position_id": pos.position_id, "symbol": pos.symbol, "side": pos.side,
+                "quantity": pos.quantity, "entry_price": pos.entry_price,
+                "exit_price": getattr(pos, "exit_price", 0.0),
+                "stop_loss_price": pos.stop_loss_price, "take_profit_price": pos.take_profit_price,
+                "notional_value": pos.notional_value, "risk_amount": pos.risk_amount,
+                "realized_pnl": pos.realized_pnl, "fees": getattr(pos, "fees", 0.0),
+                "close_reason": pos.close_reason, "regime": pos.regime,
+                "opened_ts_ms": pos.opened_ts_ms, "closed_ts_ms": pos.closed_ts_ms,
+                "venue": self._venue,
+            })
+        except Exception:  # noqa: BLE001 - durability must never break trading
+            log.exception("mirror trade failed")
+
+    def _mirror_equity(self) -> None:
+        s = self._orchestrator.summary()
+        self._mirror.put_equity(int(time.time() * 1000), s.equity, s.drawdown_pct,
+                                s.unrealized_pnl, s.open_count, s.realized_pnl - s.fees_paid)
 
 
 TradingEngine = PaperTradingEngine

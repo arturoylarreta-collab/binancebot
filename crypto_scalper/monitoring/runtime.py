@@ -39,6 +39,7 @@ class RuntimeState:
     orchestrator: Any = None
     adapter: Any = None
     ws_manager: Any = None
+    mirror: Any = None
     states: Dict[str, Any] = field(default_factory=dict)
     notes: List[str] = field(default_factory=list)
 
@@ -91,6 +92,12 @@ class RuntimeState:
             "feed_age_ms": feed_age,
             "books": books,
             "ws": ws_info,
+        }
+        m = self.mirror
+        out["firestore"] = None if m is None else {
+            "project": m.project, "bot_id": m.bot_id, "writes_ok": m.writes_ok,
+            "pending": len(m._pending), "last_error": m.last_error,
+            "last_flush_ms": m.last_flush_ms,
         }
         if adapter is not None and hasattr(adapter, "stream_connected"):
             out["user_stream_connected"] = bool(adapter.stream_connected)

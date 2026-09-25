@@ -107,6 +107,9 @@ class ObservabilityRepository(Repository):
         self._start_equity = float(value)
         self._peak_equity = max(self._peak_equity, float(value)) if self._equity_fn else float(value)
 
+    def set_peak_equity(self, value: float) -> None:
+        self._peak_equity = max(self._peak_equity, float(value))
+
     async def tick(self) -> None:
         """Heartbeat independent of trading activity (throttled)."""
         await self._maybe_heartbeat()

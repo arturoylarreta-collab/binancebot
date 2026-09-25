@@ -363,6 +363,9 @@ footer { color: var(--muted); font-size: 12px; margin-top: 24px; text-align: cen
     const synced = books.filter(([, b]) => b.synced).length;
     rows.push(["Order books", line(books.length && synced === books.length ? true : synced ? null : false, `${synced}/${books.length} sincronizados`)]);
     if (h.user_stream_connected !== undefined) rows.push(["User stream (testnet)", line(h.user_stream_connected, h.user_stream_connected ? "conectado" : "reconectando (REST activo)")]);
+    const fs = h.firestore;
+    rows.push(["Persistencia", fs ? line(!fs.last_error ? true : null, `Firestore · ${nf(0).format(fs.writes_ok)} escrituras` + (fs.last_error ? " · reintentando" : ""))
+                                  : line(null, "solo local (se pierde al reiniciar)")]);
     rows.push(["Snapshots procesados", nf(0).format(h.snapshots_processed || 0)]);
     rows.push(["Errores de loop", line(h.loop_errors ? null : true, String(h.loop_errors || 0))]);
     if (h.paused) rows.push(["Pausa", esc(h.pause_reason || "—")]);

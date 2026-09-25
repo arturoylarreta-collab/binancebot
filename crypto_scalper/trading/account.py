@@ -83,6 +83,16 @@ class PaperAccount:
     def peak_equity(self) -> float:
         return self._peak_equity
 
+    def restore(self, *, cash: float, realized_pnl: float, fees_paid: float,
+                peak_equity: float, start_equity: float = 0.0) -> None:
+        """Resume a previous session (durable mirror) instead of resetting."""
+        if start_equity > 0:
+            self._start_equity = float(start_equity)
+        self._cash = float(cash)
+        self._realized_pnl = float(realized_pnl)
+        self._fees_paid = float(fees_paid)
+        self._peak_equity = max(float(peak_equity), self._cash)
+
     # ── accounting ───────────────────────────────────────────────────────────
 
     def realize_close(self, position: ManagedPosition) -> None:
