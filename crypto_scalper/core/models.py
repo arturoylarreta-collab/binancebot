@@ -319,6 +319,8 @@ class ManagedPosition:
     closed_ts_ms: int = 0
     realized_pnl: float = 0.0
     close_reason: str = ""
+    fees: float = 0.0              # entry + exit commissions (actual or estimated)
+    exit_price: float = 0.0
 
 
 # ── Risk ───────────────────────────────────────────────────────────────────────

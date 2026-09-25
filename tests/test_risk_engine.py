@@ -120,7 +120,8 @@ class TestHierarchy:
 class TestDailyLossLimit:
     def test_rejected_when_daily_loss_at_limit(self):
         engine = RiskEngine(_config(daily_loss_limit_pct=0.03))
-        portfolio = _portfolio(equity=10_000, daily_realized_pnl=-300.0)
+        # day opened at 10k: -300 realized → equity 9.7k → exactly 3% of day-start
+        portfolio = _portfolio(equity=9_700, daily_realized_pnl=-300.0)
         dec = engine.assess(_signal(), portfolio, entry_price=100.0, atr=1.0)
         assert dec.verdict == RiskVerdict.TRADING_HALTED.name
         assert dec.reason == RejectReason.DAILY_LOSS_LIMIT.name

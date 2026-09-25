@@ -234,6 +234,8 @@ def _load_risk_config() -> RiskConfig:
         max_total_open_risk_pct=_as_float("RISK_MAX_TOTAL_OPEN_RISK_PCT", 0.03),
         max_positions=_as_int("RISK_MAX_POSITIONS", 10),
         max_leverage=_as_int("RISK_MAX_LEVERAGE", 1),
+        min_stop_pct=_as_float("RISK_MIN_STOP_PCT", 0.0005),
+        max_stop_pct=_as_float("RISK_MAX_STOP_PCT", 0.05),
         daily_loss_limit_pct=_as_float("RISK_DAILY_LOSS_LIMIT_PCT", 0.03),
         max_drawdown_pct=_as_float("RISK_MAX_DRAWDOWN_PCT", 0.10),
         correlated_group_exposure_cap_pct=_as_float(

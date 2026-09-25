@@ -44,6 +44,8 @@ class WebSocketManager:
         self._metrics = metrics
         self._url = config.url
         self._tasks: List[asyncio.Task] = []
+        self.last_message_mono: float = 0.0
+        self.connected: int = 0
 
     @staticmethod
     def build_streams(symbols: List[str]) -> List[str]:
@@ -80,7 +82,9 @@ class WebSocketManager:
 
     async def _run_connection(self, streams: List[str], idx: int) -> None:
         attempt = 0
+        loop = asyncio.get_running_loop()
         while True:
+            started = loop.time()
             try:
                 await self._connect_and_read(streams, idx)
             except asyncio.CancelledError:
@@ -94,6 +98,10 @@ class WebSocketManager:
                 self._metrics.incr("ws.disconnects")
 
             self._metrics.incr("ws.reconnects")
+            # A connection that lived long enough was healthy: Binance closes
+            # every stream after 24h, which must not escalate the backoff.
+            if loop.time() - started > 60.0:
+                attempt = 0
             delay = self._backoff_delay(attempt)
             attempt += 1
             self._metrics.set_gauge("ws.backoff_s", delay)
@@ -115,12 +123,14 @@ class WebSocketManager:
             async with session.ws_connect(url, autoping=True) as ws:
                 log.info("ws connected", extra={"conn": idx})
                 self._metrics.incr("ws.connections.active")
+                self.connected += 1
                 await self._bus.publish(
                     LifecycleEvent(topic=LIFECYCLE, kind="ws.connected", detail={"conn": idx})
                 )
                 try:
                     await self._read_loop(ws, idx)
                 finally:
+                    self.connected -= 1
                     self._metrics.decr("ws.connections.active")
 
     async def _read_loop(self, ws: aiohttp.ClientWebSocketResponse, idx: int) -> None:
@@ -135,12 +145,8 @@ class WebSocketManager:
                 raise exc
 
             if msg.type == aiohttp.WSMsgType.TEXT:
-                text = msg.data
-                if text in ("ping", '{"e":"ping"}'):
-                    await ws.send_str("pong")
-                    self._metrics.incr("ws.pong_sent")
-                    continue
-                await self._handle_frame(text, idx, ws)
+                self.last_message_mono = asyncio.get_running_loop().time()
+                await self._handle_frame(msg.data, idx, ws)
             elif msg.type == aiohttp.WSMsgType.PING:
                 await ws.pong(msg.data)
             elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
@@ -191,14 +197,9 @@ class WebSocketManager:
             # A bounded consumer queue overflowed: signal a resync for that
             # symbol instead of blocking the WebSocket receive loop.
             self._metrics.incr("ws.queue_overflow")
-            log.error("ws queue overflow", extra={"topic": event.topic})
-            await self._bus.publish_nowait(
-                LifecycleEvent(
-                    topic=LIFECYCLE,
-                    kind="queue.overflow",
-                    symbol=event.topic.rsplit(".", 1)[-1],
-                )
-            )
+            log.warning("ws queue overflow; event dropped", extra={"topic": event.topic})
+            # Depth gaps are caught by the pu-continuity check, which triggers a
+            # REST resync; dropped trades only degrade one feature window.
 
 
 class ExchangeStalled(Exception):

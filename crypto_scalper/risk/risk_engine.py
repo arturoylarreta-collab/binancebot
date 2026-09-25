@@ -106,9 +106,12 @@ class RiskEngine:
             )
 
         # ── 2. Daily loss limit ──────────────────────────────────────
+        # Denominator is start-of-day equity (equity before today's realized PnL),
+        # otherwise the limit loosens as losses shrink current equity.
         daily_loss_pct = 0.0
-        if portfolio.equity > 0:
-            daily_loss_pct = abs(min(0.0, portfolio.daily_realized_pnl)) / portfolio.equity
+        day_start_equity = portfolio.equity - portfolio.daily_realized_pnl
+        if day_start_equity > 0:
+            daily_loss_pct = abs(min(0.0, portfolio.daily_realized_pnl)) / day_start_equity
         daily_ok = daily_loss_pct < self._config.daily_loss_limit_pct
         checks["daily_loss_limit"] = daily_ok
         if not daily_ok:
@@ -136,7 +139,7 @@ class RiskEngine:
         if portfolio.consecutive_losses >= cl.pause_after:
             return self._decision(
                 signal.symbol, now_ms, RiskVerdict.TRADING_HALTED,
-                RejectReason.KILL_SWITCH, checks,
+                RejectReason.CONSECUTIVE_LOSSES, checks,
                 details={"consecutive_losses": portfolio.consecutive_losses,
                          "pause_after": cl.pause_after},
             )
@@ -185,6 +188,14 @@ class RiskEngine:
         )
         sl_price = sl.stop_price
         stop_distance = sl.stop_distance
+        # No entry price / no ATR → no valid stop → never size a trade.
+        checks["stop_loss_valid"] = sl.method != "invalid" and sl_price > 0 and stop_distance > 0
+        if not checks["stop_loss_valid"]:
+            return self._decision(
+                signal.symbol, now_ms, RiskVerdict.REJECTED,
+                RejectReason.DATA_NOT_READY, checks,
+                details={"entry_price": _entry, "atr": atr},
+            )
 
         sizing = self._sizer.calculate(
             portfolio.equity, _entry, sl_price, _side,
