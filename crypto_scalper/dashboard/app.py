@@ -1,73 +1,71 @@
-"""Crypto Scalper Observability Dashboard (FASE 8.5).
+"""Multipage entrypoint and Resumen; run in a process separate from the bot.
 
-Capa fina de Streamlit sobre `crypto_scalper.monitoring.dashboard_data.py`.
-Lee EXCLUSIVAMENTE la SQLite que escribe el bot (paper/backtest): sin estado de
-cola, sin imports a los motores, sin red.  Path por env `DASHBOARD_DB_PATH`
-(default `logs/paper.db`).
+    python -m streamlit run crypto_scalper/dashboard/app.py
 
-Arranque:
-
-    streamlit run crypto_scalper/dashboard/app.py
+Business data comes exclusively from DASHBOARD_DB_PATH. Shared widgets execute
+here on every page run. No engines, exchange clients or bot state are imported.
 """
 
 from __future__ import annotations
 
 import os
+from pathlib import Path
+import sqlite3
 
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
-from crypto_scalper.monitoring import dashboard_data as dd
+from crypto_scalper.dashboard import charts, common
 
-st.set_page_config(page_title="Crypto Scalper", layout="wide")
-st.title("Crypto Scalper - Observability")
 
-db_path = os.environ.get("DASHBOARD_DB_PATH", "logs/paper.db")
-if not os.path.exists(db_path):
-    st.error(f"DB no encontrada: {db_path} (configura DASHBOARD_DB_PATH)")
+def summary() -> None:
+    """Render the overview using the shared date/symbol/mode selection."""
+    data = common.page_data("summary")
+    common.kpis(data)
+    with st.container(border=True):
+        charts.equity_chart(data["equity"])
+    with st.container(border=True):
+        charts.pnl_chart(data["pnl"])
+    with st.container(border=True):
+        charts.signal_chart(data["distribution"])
+
+
+st.set_page_config(page_title="Crypto Scalper · Análisis", page_icon=":material/monitoring:", layout="wide")
+page = st.navigation([
+    st.Page(summary, title="Resumen", icon=":material/monitoring:", default=True),
+    st.Page("pages/1_Historial_Trades.py", title="Historial de trades", icon=":material/history:"),
+    st.Page("pages/2_Señales_y_Rechazos.py", title="Señales y rechazos", icon=":material/filter_alt:"),
+    st.Page("pages/3_Riesgo_y_Exposición.py", title="Riesgo y exposición", icon=":material/shield:"),
+    st.Page("pages/4_Logs_del_Sistema.py", title="Logs del sistema", icon=":material/receipt_long:"),
+])
+requested_page = st.session_state.pop("_dashboard_requested_page", None)
+if requested_page:
+    st.switch_page(f"pages/{requested_page}")
+for widget_key, widget_value in st.session_state.pop("_dashboard_saved_widgets", {}).items():
+    st.session_state[widget_key] = widget_value
+st.title(page.title)
+st.caption("CRYPTO SCALPER · Análisis de operaciones")
+
+# The entrypoint runs on every page. Keep a stable timer across navigation.
+if st.session_state.get("auto_refresh", True):
+    st_autorefresh(interval=5_000, key="dashboard_refresh")
+
+db_path = str(Path(os.environ.get("DASHBOARD_DB_PATH", "logs/paper.db")).expanduser().resolve())
+if not Path(db_path).is_file():
+    st.info("No se encontró la base de datos. Configura DASHBOARD_DB_PATH con la SQLite del bot. "
+            "El dashboard esperará a que exista; no crea ni modifica bases de datos.")
     st.stop()
 
-conn = dd.connect(db_path)
-
-status = dd.bot_status(conn)
-if "error" not in status:
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Modo / Estado", f"{status['mode']} / {status['status']}")
-    c2.metric("Equity", f"{status['equity']:,.2f} USDT")
-    c3.metric("Drawdown", f"{status['drawdown_pct']*100:.2f}%")
-    c4.metric("Posiciones abiertas", status["open_count"])
-    c5.metric("Trades hoy", status["trades_today"])
-    c6.metric("Uptime (h)", f"{status['uptime_ms']/3_600_000:.1f}")
-else:
-    st.info(f"Sin heartbeats aún ({status}). El bot debe correr una vez y persistir.")
-
-st.subheader("PnL diario")
-pnl = dd.daily_pnl(conn)
-r, u, t, d = st.columns(4)
-r.metric("Realized", f"{pnl['realized']:+,.2f}")
-u.metric("Unrealized", f"{pnl['unrealized']:+,.2f}")
-t.metric("Trades hoy", pnl["trades_today"])
-d.metric("Drawdown", f"{pnl['drawdown_pct']*100:.2f}%")
-
-st.subheader("Métricas de riesgo")
-rm = dd.risk_metrics(conn)
-m1, m2, m3, m4, m5, m6 = st.columns(6)
-m1.metric("Trades cerrados", rm["total_trades"])
-m2.metric("Win rate", f"{rm['win_rate']*100:.1f}%")
-m3.metric("PnL medio", f"{rm['avg_pnl']:+.4f}")
-m4.metric("Exposición total", f"{rm['total_exposure']:,.2f}")
-m5.metric("Abiertas", rm["open_count"])
-m6.metric("Max drawdown", f"{rm['max_drawdown_pct']*100:.2f}%")
-
-st.subheader("Posiciones abiertas")
-positions = dd.open_positions(conn)
-if positions:
-    st.dataframe(positions)
-else:
-    st.caption("Sin posiciones abiertas")
-
-st.subheader("Últimas señales")
-signals = dd.recent_signals(conn, limit=10)
-if signals:
-    st.dataframe(signals)
-else:
-    st.caption("Sin señales registradas todavia")
+try:
+    options = common.load_options(db_path)
+    common.sidebar(db_path, options)
+    st.session_state["_dashboard_entrypoint_running"] = True
+    try:
+        page.run()
+    finally:
+        st.session_state["_dashboard_entrypoint_running"] = False
+except sqlite3.OperationalError:
+    st.warning("La base no está disponible, está ocupada o la consulta excedió el tiempo permitido. "
+               "Se reintentará en el siguiente refresco. Reduce el rango de fechas si persiste.")
+except sqlite3.DatabaseError:
+    st.error("No se pudo leer esta base SQLite. Comprueba que corresponde al bot y que está íntegra.")

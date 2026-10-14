@@ -68,7 +68,8 @@ crypto_scalper/
                      alertas de transiciones SL/TP, halt de riesgo con cooldown, marks
                      para pnl_unrealized, heartbeat), dashboard_data (agregaciones puras
                      sobre SQLite para el dashboard)  [FASE 8.5]
-  dashboard/         app.py — Streamlit independiente que lee SOLO la DB  [FASE 8.5]
+  dashboard/         app.py — Resumen y navegación multipágina, filtros globales,
+                     gráficos Plotly, caché de 4 s y refresco de 5 s; SOLO SQLite
   main.py            pipeline en tiempo real + modos one-shot / signal / paper / backtest
 ```
 
@@ -223,6 +224,151 @@ equity/drawdown/exposición, posiciones abiertas, señales recientes y métricas
 
 7) **Entornos**: copia `.env.example` a `.env` (dev), o crea `.env.<APP_ENV>`.
    El modo LIVE bloquea el arranque si no existe `LIVE_TRADING_ENABLED=true`.
+
+## Dashboard interactivo multipágina
+
+El dashboard se ejecuta como **proceso independiente** del bot. No importa sus
+motores ni llama a Binance; todos los datos de negocio proceden de SQLite.
+`RiskEngine`, `ExecutionEngine` y el escritor de la base permanecen intactos.
+
+### Diagnóstico del dashboard anterior
+
+1. La interfaz, las lecturas y la presentación estaban concentradas en una sola
+   página, sin filtros compartidos, caché ni actualización automática.
+2. Las conexiones se abrían en cada ejecución sin cierre explícito. Además, la
+   función de riesgo devolvía exposición cero si no había operaciones cerradas,
+   aunque hubiera posiciones abiertas.
+3. No se explicaban las limitaciones del esquema: capital global, modo ausente
+   en posiciones/señales, precio de salida fuera de `positions` y logs de texto
+   distintos de los eventos persistidos. Ahora estas diferencias son visibles.
+
+### Estructura
+
+```text
+crypto_scalper/
+  monitoring/dashboard_data.py       # Consultas SQL parametrizadas, sin Streamlit
+  dashboard/
+    app.py                           # Resumen, st.navigation y auto-refresco
+    common.py                        # Caché, filtros UTC y presentación compartida
+    charts.py                        # Gráficos Plotly
+    pages/
+      1_Historial_Trades.py
+      2_Señales_y_Rechazos.py
+      3_Riesgo_y_Exposición.py
+      4_Logs_del_Sistema.py
+    tests/                           # SQLite temporal, mocks y Streamlit AppTest
+```
+
+### Arranque en Windows / PowerShell
+
+Desde la raíz del repositorio, con Python 3.11 o posterior:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+$env:DASHBOARD_DB_PATH = "C:\ruta\al\bot\logs\paper.db"
+.\.venv\Scripts\python.exe -m streamlit run crypto_scalper/dashboard/app.py --server.address 127.0.0.1
+```
+
+En Linux/macOS, después de crear el entorno:
+
+```bash
+.venv/bin/python -m pip install -e '.[dev]'
+export DASHBOARD_DB_PATH=/ruta/al/bot/logs/paper.db
+.venv/bin/python -m streamlit run crypto_scalper/dashboard/app.py --server.address 127.0.0.1
+```
+
+Abre [el dashboard local](http://localhost:8501). La ruta predeterminada es
+`logs/paper.db`, relativa al directorio desde el que arrancas. Exporta la variable
+en el proceso del dashboard: este no necesita cargar las claves del bot ni su
+`.env`. Si la DB aún no existe, muestra un aviso y vuelve a comprobarla con el
+refresco; nunca crea una DB ni tablas. Para un backtest apunta a su propia SQLite.
+Dos usuarios conectados al mismo servidor conservan filtros independientes y
+comparten los resultados cacheados cuando seleccionan los mismos filtros.
+
+### Vistas y filtros
+
+- **Resumen:** capital y drawdown con ejes separados, PnL realizado acumulado,
+  distribución LONG/SHORT/NEUTRA y aprobaciones/rechazos, y cuatro KPIs.
+- **Historial de trades:** precios de entrada/salida, dirección, PnL bruto, causa
+  y fecha de cierre. Un precio de salida vacío significa que falta la orden
+  ejecutada; no se infiere un precio artificial a partir del resultado.
+- **Señales y rechazos:** score, dirección, elegibilidad, motivo y fecha. Una
+  señal elegible con rechazo posterior cuenta como rechazada en el gráfico.
+  «Aprobada» significa elegible LONG/SHORT sin rechazo registrado; no demuestra
+  que se haya ejecutado una orden.
+- **Riesgo y exposición:** nominal bruto actual por símbolo y dirección,
+  posiciones abiertas y máximo drawdown del período completo.
+- **Logs del sistema:** eventos, decisiones de riesgo y reconciliaciones de
+  SQLite. No se leen archivos `.log` ni se envían payloads completos al navegador.
+
+Las fechas se interpretan en **UTC** e incluyen ambos días seleccionados (SQL
+usa inicio inclusivo y medianoche del día siguiente exclusiva). Se filtra por
+fecha de cierre para trades/PnL, de apertura para posiciones abiertas y de
+registro para señales, eventos y heartbeats. El rango es fijo: amplía su final
+para incluir días nuevos cuando dejes abierta una sesión durante varios días.
+Vaciar la selección de símbolos significa «Todos». Los filtros se conservan al
+navegar porque se renderizan una sola vez en el punto de entrada.
+
+Las tablas permiten ordenar cualquier columna, conservando precios y fechas
+como valores tipados. Muestran hasta 100/500/1.000/5.000 filas recientes, según
+el selector; el ordenamiento afecta a las filas cargadas. **Los agregados y el
+PnL acumulado usan todo el intervalo**, independientemente del límite de tabla.
+Los gráficos largos se muestrean hasta 2.001 puntos por serie, preservando los
+extremos; pueden omitir picos intermedios. El máximo drawdown se consulta sobre
+todos los heartbeats. Pausa el refresco para analizar sin interrupciones; el
+zoom de Plotly se conserva entre refrescos con los mismos filtros.
+
+### Semántica del esquema y concurrencia
+
+- `heartbeats` almacena **toda la cartera**, sin símbolo. Capital y drawdown se
+  filtran por fecha y modo y se identifican como globales al seleccionar símbolos.
+  La interfaz muestra la fecha del heartbeat: refrescar la página no genera
+  nuevos datos del bot. Modos diferentes se dibujan como series separadas.
+- En el esquema actual, posiciones, señales y eventos **no tienen columna de
+  modo**. Una selección específica solo incluye esas filas si la base tiene un
+  único modo identificado por sus heartbeats. Si mezcla modos o carece de esa
+  información, se muestran vacías con un aviso. «Todos» permite verlas sin
+  atribuirles un modo. Usa una base por modo/sesión; separar una base mezclada
+  con exactitud requeriría ampliar la persistencia, fuera de este cambio.
+- `positions` conserva el último estado, no un historial de estados. La
+  exposición es la de posiciones **todavía abiertas cuya apertura cumple el
+  filtro**, no una reconstrucción de la cartera en una fecha pasada.
+- El PnL de `positions` es bruto, antes de comisiones y financiación. La curva
+  acumula desde cero al inicio del intervalo. Solo incluye posiciones `CLOSED`
+  con motivo no nulo ni vacío; el valor predeterminado de `close_reason` es `''`.
+- Las lecturas usan URI `mode=ro`, `query_only`, espera de bloqueo de 50 ms y
+  presupuesto de ejecución de 250 ms por consulta. Los cursores y conexiones se
+  cierran incluso ante errores; no se mantienen transacciones largas. Los
+  resultados se cachean cuatro segundos con número de entradas acotado.
+  Consultas distintas pueden observar commits distintos durante un refresco.
+- **Para lectura/escritura concurrente sin bloqueos de lectores se requiere WAL
+  en la base del bot.** El dashboard no ejecuta migraciones, no crea índices ni
+  cambia `journal_mode`. El repositorio actual no activa WAL automáticamente;
+  prepara la base antes de arrancar el bot, con el bot detenido:
+
+  ```powershell
+  # Usa una base existente; DASHBOARD_DB_PATH debe apuntar al archivo correcto.
+  .\.venv\Scripts\python.exe -c "import os, pathlib, sqlite3; p=pathlib.Path(os.environ['DASHBOARD_DB_PATH']).resolve(); c=sqlite3.connect(p.as_uri()+'?mode=rw', uri=True); print(c.execute('PRAGMA journal_mode=WAL').fetchone()[0]); c.close()"
+  ```
+
+  Este paso administrativo separado sí cambia la configuración de SQLite y
+  debe devolver `wal`. El dashboard permanece de solo lectura. Con el modo
+  `delete` original pueden existir bloqueos breves de lectores; no se garantiza
+  aislamiento del escritor en ese modo. No uses `immutable=1` sobre una DB activa.
+  Si una consulta supera su presupuesto, se cancela y la interfaz muestra un
+  aviso; no reintenta en bucle dentro del proceso del bot.
+
+### Verificación sin capital real
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest crypto_scalper/dashboard/tests tests/test_dashboard_data.py tests/test_monitoring.py -q
+```
+
+Las pruebas usan bases temporales y `unittest.mock`, validan las consultas,
+límites UTC, modo ambiguo, PnL, exposición sin cierres, protección de escritura,
+caché/expiración, cierre de conexiones y navegación con filtros compartidos.
+`AppTest` ejecuta las cinco páginas sin abrir un servidor ni conectar a Binance.
 
 ## Configuración aplicada por defecto
 

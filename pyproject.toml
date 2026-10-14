@@ -14,6 +14,8 @@ dependencies = [
     "scikit-learn>=1.9",
     "joblib>=1.3",
     "streamlit>=1.57",
+    "plotly>=6.0",
+    "streamlit-autorefresh>=1.0.1",
 ]
 
 [project.optional-dependencies]
@@ -27,7 +29,7 @@ include = ["crypto_scalper*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests"]
+testpaths = ["tests", "crypto_scalper/dashboard/tests"]
 markers = [
     "slow: longer-running end-to-end ML fits (deselect with -m 'not slow')",
 ]
