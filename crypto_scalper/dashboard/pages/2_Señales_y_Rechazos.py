@@ -13,5 +13,5 @@ common.table([
      "Elegible": "Sí" if r["eligible"] else "No",
      "Motivo de rechazo": common.reason(r["rejection_reason"]),
      "Fecha": common.timestamp(r["ts_ms"])} for r in data["signals"]
-], "signals_table", ("Score",))
+], "signals_table", {"Score": 1})
 st.caption("Una señal elegible puede ser rechazada posteriormente por riesgo o por el estado de la operativa.")

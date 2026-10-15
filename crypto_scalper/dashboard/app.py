@@ -52,20 +52,27 @@ if st.session_state.get("auto_refresh", True):
 
 db_path = str(Path(os.environ.get("DASHBOARD_DB_PATH", "logs/paper.db")).expanduser().resolve())
 if not Path(db_path).is_file():
+    common.preserve_widgets()
     st.info("No se encontró la base de datos. Configura DASHBOARD_DB_PATH con la SQLite del bot. "
             "El dashboard esperará a que exista; no crea ni modifica bases de datos.")
     st.stop()
 
+sidebar_rendered = False
 try:
     options = common.load_options(db_path)
     common.sidebar(db_path, options)
+    sidebar_rendered = True
     st.session_state["_dashboard_entrypoint_running"] = True
     try:
         page.run()
     finally:
         st.session_state["_dashboard_entrypoint_running"] = False
-except sqlite3.OperationalError:
-    st.warning("La base no está disponible, está ocupada o la consulta excedió el tiempo permitido. "
-               "Se reintentará en el siguiente refresco. Reduce el rango de fechas si persiste.")
-except sqlite3.DatabaseError:
-    st.error("No se pudo leer esta base SQLite. Comprueba que corresponde al bot y que está íntegra.")
+except sqlite3.DatabaseError as error:
+    # Without a sidebar in this run, Streamlit would drop the selected filters.
+    if not sidebar_rendered:
+        common.preserve_widgets()
+    if isinstance(error, sqlite3.OperationalError):
+        st.warning("La base no está disponible, está ocupada o la consulta excedió el tiempo permitido. "
+                   "Se reintentará en el siguiente refresco. Reduce el rango de fechas si persiste.")
+    else:
+        st.error("No se pudo leer esta base SQLite. Comprueba que corresponde al bot y que está íntegra.")

@@ -97,6 +97,48 @@ def test_empty_database_and_partial_date_selection(database, tmp_path, monkeypat
     assert any("Selecciona la fecha" in item.value for item in app.info)
 
 
+def test_filters_survive_locked_or_missing_database(database, tmp_path, monkeypatch):
+    """A run that ends before the sidebar must not reset filters or resume refresh."""
+    monkeypatch.setenv("DASHBOARD_DB_PATH", str(database))
+    app = AppTest.from_file(str(APP), default_timeout=30).run()
+    app.multiselect(key="filter_symbols").set_value(["BTCUSDT"])
+    app.selectbox(key="filter_mode").set_value("paper")
+    app.toggle(key="auto_refresh").set_value(False)
+    app.run()
+    with patch.object(common, "load_options", side_effect=sqlite3.OperationalError("database is locked")):
+        app.run()
+        assert app.warning and not app.exception
+        app.run()  # Repeated failures keep the preserved selection.
+    monkeypatch.setenv("DASHBOARD_DB_PATH", str(tmp_path / "rotated.db"))
+    app.run()
+    assert "No se encontró" in app.info[0].value
+    monkeypatch.setenv("DASHBOARD_DB_PATH", str(database))
+    app.run()
+    assert not app.exception
+    assert app.multiselect(key="filter_symbols").value == ["BTCUSDT"]
+    assert app.selectbox(key="filter_mode").value == "paper"
+    assert app.toggle(key="auto_refresh").value is False
+    assert app.session_state["dashboard_filters"].symbols == ("BTCUSDT",)
+    # Completing a partial date range is not overwritten by preserved values.
+    app.date_input(key="filter_dates").set_value((date(2026, 9, 22),)).run()
+    app.date_input(key="filter_dates").set_value((date(2026, 9, 22), date(2026, 9, 23))).run()
+    assert app.date_input(key="filter_dates").value == (date(2026, 9, 22), date(2026, 9, 23))
+    assert not any("Selecciona la fecha" in item.value for item in app.info)
+
+
+def test_unknown_exit_price_stays_numeric_null_with_spanish_format():
+    rows = [{"Precio salida": None, "PnL": -5.0}, {"Precio salida": 1234.5, "PnL": 25.0}]
+    styler = common.styled(rows, {"Precio salida": 4, "PnL": 2})
+    assert styler.data["Precio salida"].dtype.kind == "f"  # sortable numbers, not text
+    assert styler.data["Precio salida"].isna().tolist() == [True, False]  # never inferred
+    html = styler.to_html()
+    assert "1.234,5000" in html and "-5,00" in html
+    assert common.number(1020, 2) == "1.020,00"
+    assert common.number(-0.001, 2, sign=True) == "+0,00"
+    assert common.number(-1234.567, 2, sign=True) == "-1.234,57"
+    assert common.percent(0.02) == "2,00 %"
+
+
 def test_cached_reads_include_filters_expire_and_close_connections(database, selection):
     connections = []
     real_connect = dd.connect

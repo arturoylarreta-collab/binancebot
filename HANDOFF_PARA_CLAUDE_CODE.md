@@ -1,6 +1,9 @@
 # Handoff de Binancebot para Claude Code
 
 Fecha de preparación: 14 de octubre de 2026 (America/Caracas).
+Actualizado el 14 de octubre de 2026 por la sesión de Claude Code que completó
+la validación visual (ver secciones 7 y 8). Los resultados de la sesión
+anterior se conservan como historial.
 
 ## 1. Carpeta de origen y estado de Git
 
@@ -16,6 +19,8 @@ C:\Users\Jose Arturo\Documents\ChatGPT\binancebot
 - Mensaje: `FASE 5-8.5: risk engine, execution, paper trading, backtesting, observability, and SQLite audit trail`.
 - **Los cambios descritos forman parte del commit que incluye este handoff**, preparado para publicación en `origin/codex/dashboard-interactivo` por petición del usuario. Para continuar desde GitHub, utiliza esa rama, no `main`.
 - Si usas la carpeta original, conserva cualquier cambio local posterior: revisa `git status` antes de actualizar. No hagas `git reset --hard` ni sustituyas esa carpeta por un clon.
+- Commit publicado de referencia: `7df145536f68c854ae84272e89b74f233e0054ef` (`feat(dashboard): add interactive multipage analysis and Claude handoff`). La sesión de validación partió de ese commit con el árbol limpio. Sus correcciones se confirmaron y publicaron en `origin/codex/dashboard-interactivo` en el commit siguiente, que incluye esta versión del handoff, por petición del usuario.
+- Al hacer `git fetch` apareció una rama remota nueva, `origin/fase-9-testnet`. No se revisó ni se integró.
 - El documento inicial del usuario está en `C:\Users\Jose Arturo\Downloads\prompt_para_bot_de_binance.md`. Es una referencia de requisitos, no código fuente ni autorización para ampliar el alcance.
 
 Para obtener el trabajo en una carpeta nueva:
@@ -95,6 +100,8 @@ Detalles importantes:
 - Los agregados usan todo el intervalo. Las tablas muestran hasta 5.000 filas; las curvas se muestrean conservando primer/último punto, después de calcular el acumulado.
 - `app.py` registra las páginas con `st.navigation`, renderiza los filtros comunes y crea `st_autorefresh(interval=5_000)`. Hay un interruptor de pausa.
 - `require_entrypoint()` resuelve la entrada inicial por la navegación antigua que Streamlit puede detectar al existir `pages/`. Redirige por `app.py`, conserva los widgets y restaura la página solicitada.
+- `preserve_widgets()` (sesión de validación) guarda filtros y pausa cuando una ejecución termina antes de renderizar la barra lateral: redirección, base ausente o lectura bloqueada. Solo se llama si la barra no se renderizó, para no sobrescribir una selección más reciente. Los valores predeterminados de los widgets viven en Session State, no en sus argumentos, para que restaurarlos no provoque el aviso de conflicto de Streamlit.
+- `number()`/`percent()` y `styled()` aplican separadores españoles a KPIs y tablas sin convertir las celdas en texto (la ordenación sigue siendo numérica).
 - No se han modificado los motores, el escritor SQLite ni el esquema de persistencia del bot.
 
 ## 5. Semántica que no debe inventarse
@@ -126,7 +133,9 @@ Se comprobó el entorno existente al preparar este documento:
 - La `.venv` tiene `include-system-site-packages = true`; hereda paquetes globales y **no es un entorno aislado reproducible**. En la sesión de desarrollo anterior Streamlit era `1.60.0`. Revisar compatibilidad si aparecen cambios de comportamiento.
 - `.venv/` está excluida localmente mediante `.git/info/exclude`.
 - En la carpeta original existe una DB **sintética de prueba**, no de operaciones reales, en `.venv/dashboard-preview/sesión #1.db`. No está versionada ni disponible en un clon nuevo.
+- La sesión de validación generó otra con el comando de abajo en `logs/dashboard-preview/sesión #1.db`, y una copia de prueba en `logs/dashboard-preview/prueba-estados.db` (journal `delete`) para simular base ausente, vacía y bloqueada. `logs/` está en `.gitignore`.
 - No se ha entregado ni verificado una base real de producción para este dashboard.
+- `pyproject.toml` exige ahora `streamlit>=1.64` (versión validada; se usan `delta_arrow` y tamaños de `st.metric`) y `jinja2>=3.1` (formato de tablas con `Styler`). `requirements.txt` no incluye Streamlit desde antes de este trabajo y queda fuera del alcance autorizado.
 
 Desde PowerShell:
 
@@ -140,10 +149,12 @@ git status --short --branch
 # Regresión sin el test marcado slow:
 .\.venv\Scripts\python.exe -m pytest -q -m 'not slow'
 
-# Preview con datos sintéticos existentes:
-$env:DASHBOARD_DB_PATH = (Resolve-Path -LiteralPath '.venv/dashboard-preview/sesión #1.db').Path
-.\.venv\Scripts\python.exe -m streamlit run crypto_scalper/dashboard/app.py --server.address 127.0.0.1 --server.port 8501 --server.headless true --browser.gatherUsageStats false
+# Preview con datos sintéticos (proceso nuevo, sin recarga en caliente):
+$env:DASHBOARD_DB_PATH = (Resolve-Path -LiteralPath 'logs/dashboard-preview/sesión #1.db').Path
+.\.venv\Scripts\python.exe -m streamlit run crypto_scalper/dashboard/app.py --server.address 127.0.0.1 --server.port 8501 --server.headless true --server.fileWatcherType none --client.toolbarMode viewer --browser.gatherUsageStats false
 ```
+
+Con `--server.fileWatcherType none`, **reinicia el proceso tras cada cambio de código**: no recarga módulos (ver 7.2).
 
 Para una instalación limpia desde la rama de GitHub:
 
@@ -155,8 +166,10 @@ python -m venv .venv
 # Solo se crea si ese archivo de prueba aún no existe.
 .\.venv\Scripts\python.exe -c "from pathlib import Path; from crypto_scalper.dashboard.tests.conftest import database; p=Path('logs/dashboard-preview'); p.mkdir(parents=True, exist_ok=True); database.__wrapped__(p) if not (p/'sesión #1.db').exists() else None"
 $env:DASHBOARD_DB_PATH = (Resolve-Path -LiteralPath 'logs/dashboard-preview/sesión #1.db').Path
-.\.venv\Scripts\python.exe -m streamlit run crypto_scalper/dashboard/app.py --server.address 127.0.0.1 --server.port 8501 --server.headless true --browser.gatherUsageStats false
+.\.venv\Scripts\python.exe -m streamlit run crypto_scalper/dashboard/app.py --server.address 127.0.0.1 --server.port 8501 --server.headless true --server.fileWatcherType none --client.toolbarMode viewer --browser.gatherUsageStats false
 ```
+
+El comando de generación se ejecutó el 14 de octubre de 2026 con pytest 9.1.1 y creó la base correctamente (`database.__wrapped__` sigue disponible en esa versión).
 
 Para datos del bot, exportar `DASHBOARD_DB_PATH` con la ruta de su SQLite existente. El valor predeterminado es `logs/paper.db`; el dashboard no carga las API keys del `.env` ni crea la base.
 
@@ -185,27 +198,69 @@ No se volvió a ejecutar toda la suite ni se reinició el preview durante la
 preparación del handoff. Este resultado confirma los tests focalizados, pero no
 resuelve por sí mismo el pendiente visual descrito a continuación.
 
-### Pendiente principal: aceptación visual después de reinicio limpio
+### Pendiente de la sesión anterior (cerrado en 7.1–7.5)
 
-Se vio en navegador el Resumen, los gráficos, el filtro BTCUSDT, la pausa por teclado y la navegación al historial con el filtro conservado. Después de añadir `require_entrypoint` y recargar el servidor que ya estaba abierto, la **última comprobación visual terminó con este error**:
+La última comprobación visual previa terminó con
+`AttributeError: module 'crypto_scalper.dashboard.common' has no attribute 'require_entrypoint'`
+después de editar el código con el servidor abierto. La causa no estaba confirmada.
 
-```text
-AttributeError: module 'crypto_scalper.dashboard.common' has no attribute 'require_entrypoint'
-```
+### 7.1 Validación visual del 14 de octubre de 2026 (Claude Code)
 
-La función sí existe en el archivo actual y sus tests habían pasado. La hipótesis es un módulo antiguo retenido en el proceso de desarrollo, pero **no se confirmó** con un reinicio limpio. No dar la validación visual por cerrada ni presentar el dashboard como certificado para producción.
+Entorno: navegador integrado de Claude Desktop (Chromium), servidores Streamlit
+nuevos en `127.0.0.1:8501` (base sintética `logs/dashboard-preview/sesión #1.db`)
+y `127.0.0.1:8502` (base de prueba `prueba-estados.db`). Antes de arrancar se
+comprobó que 8500–8520 estaban libres. Solo se detuvieron procesos lanzados en
+esta sesión. Sin API keys, sin llamadas a Binance y sin bases reales.
 
-Próximos pasos recomendados al continuar:
+Verificado en navegador con el código final (proceso reiniciado tras la última edición):
 
-1. Leer este documento, `README.md` y el diff respecto al commit base, preservando cualquier cambio local posterior.
-2. Revisar el resultado de las pruebas actuales y reproducir cualquier fallo antes de modificar código.
-3. Lanzar un proceso nuevo de Streamlit contra la DB sintética, en un puerto libre, y comprobar que `common.require_entrypoint` corresponde al módulo de esta carpeta.
-4. Validar las cinco páginas y los enlaces directos con servidor recién iniciado; comprobar filtros, pausa/refresco, tablas y recuperación ante DB ausente/ocupada.
-5. Revisar detalles visuales: algunos textos nativos de Streamlit (menús, ayudas, pantalla completa) pueden seguir en inglés; la última tabla mostraba `None` para salida desconocida aunque la leyenda decía «vacío». La última modificación de las cuatro tarjetas KPI tampoco recibió aceptación visual completa.
-6. Comprobar rendimiento con una base representativa: no se ha realizado una prueba de carga grande ni demostrado ausencia de interferencia con un bot real. Los límites de tiempo protegen al lector, pero no reemplazan WAL ni una evaluación de consultas sobre históricos grandes.
-7. Documentar cualquier corrección restante y ejecutar las pruebas pertinentes. Mantener cambios fuera de riesgo/ejecución.
+| Comprobación | Resultado |
+|---|---|
+| Enlace directo `/Historial_Trades` como **primera** petición a un servidor recién iniciado | Carga sin error, filtros por defecto |
+| Enlaces directos a Señales, Riesgo y Logs en sesiones nuevas; URL inexistente | Cargan sin error; la inexistente muestra el diálogo nativo «Page not found» (inglés) y abre el Resumen |
+| Navegación por las cinco páginas y recarga F5 | Sin errores; tras F5 Streamlit reanuda la sesión de la pestaña y conserva filtros |
+| Filtros de fechas, símbolos (BTCUSDT/ETHUSDT) y modo (paper/live/Todos) | Aplicados en todas las páginas y conservados al navegar. «live» en esta base muestra el aviso de modo ambiguo y estados vacíos |
+| Auto-refresco cada 5 s, pausa y reanudación | La marca «Lectura» avanza cada 5 s, queda fija >10 s en pausa y vuelve a avanzar al reanudar |
+| Gráficos de equity/drawdown (dos ejes), PnL acumulado y distribución de señales | Correctos; hover y barra de Plotly en español |
+| Tablas: ordenación por columna | Ascendente/descendente, numérica (−5 < 10 < 25) y conservada tras un refresco |
+| Cuatro KPI | Formato `1.020,00` / `2,00 %`, color según signo, sin cortes a 1440, 800 y 375 px |
+| Base ausente | Aviso, sin crear el archivo; al restaurarla se recupera con los filtros intactos |
+| Base ocupada (`BEGIN EXCLUSIVE` en una copia con journal `delete`) | Aviso de reintento; al liberar se recupera con los filtros intactos |
+| Base vacía (SQLite sin tablas) | Estados vacíos en español, sin excepciones |
+| Ventana estrecha (800 px) y móvil (375 px) | KPI en 2×2 o en columna, tablas con desplazamiento interno, sin desbordamiento horizontal de la página ni solapes |
 
-El código y este handoff se entregan en la rama de continuación para revisión. **Publicar el commit no cierra los pendientes de aceptación visual ni certifica el dashboard para producción.**
+### 7.2 Qué fallaba y qué se corrigió
+
+1. **`AttributeError ... require_entrypoint` (causa confirmada: estado del proceso, no del código).** Con un proceso limpio no se reproduce. Se reprodujo la misma clase de fallo editando los módulos con dos servidores abiertos: tras los mismos cambios, 8502 recargó `charts.py`, mientras que 8501 siguió sirviendo el `charts.py` anterior **incluso a sesiones nuevas**, ejecutando a la vez `app.py` y `common.py` nuevos. Las páginas se ejecutan desde su archivo actual, pero los módulos auxiliares viven en `sys.modules` del proceso. Por eso una página nueva puede llamar a una función que el módulo retenido no tiene. No se aisló la carrera interna del vigilante de Streamlit en Windows. Medida: arrancar con `--server.fileWatcherType none` y reiniciar tras cada cambio (README y sección 6). Capturas: `antes/09` y `antes/10`.
+2. **Filtros perdidos ante una base bloqueada o ausente (bug real, reproducido en navegador).** Si la ejecución terminaba antes de renderizar la barra lateral, Streamlit descartaba el estado de sus widgets: los símbolos y el modo volvían a «Todos» y una pausa se reanudaba. Corregido con `preserve_widgets()`, sin sobrescribir selecciones nuevas. Hay un test de regresión que falla con el `app.py` anterior (`[] == ['BTCUSDT']`).
+3. **KPI:** etiquetas cortadas por debajo de unos 900 px; delta de Drawdown que repetía el valor y marcaba en rojo «-0.00%»; formato inglés. Ahora se reparten en una fila que se ajusta al ancho, con separadores españoles. Drawdown muestra el máximo del período (y se eliminó la métrica duplicada de Riesgo), Acierto el PnL y Exposición las posiciones abiertas. Un cambio nulo aparece en gris. En Historial, el delta de PnL repetía el valor y ahora muestra la media por trade.
+4. **Precio de salida desconocido:** Streamlit 1.64 pinta toda celda nula con el texto fijo «None» (constante del frontend, sin opción para cambiarlo). Convertirlo en «—» exigiría una columna de texto y la ordenación de precios sería alfabética. Se mantiene el valor nulo y numérico, y la leyenda dice exactamente lo que se ve: «la celda queda sin valor (la tabla la muestra como «None»)». No se infiere ningún precio.
+5. **Formato y gráficos:** separadores españoles en tablas mediante `Styler`, sin perder la ordenación numérica. «1 fila mostrada» en singular. Eje de drawdown con marcas limpias (antes `1,973 / 1,605…`). Conteos de señales enteros. Leyendas en orden. LONG/SHORT visible en exposición. Fechas «22 sep» y hover `dd/mm/aaaa`. Leyenda anclada sobre el área del gráfico para que no tape los ejes ni la barra táctil en móvil.
+6. **Interfaz:** placeholder «Todos» en Modo. Con `--client.toolbarMode viewer` desaparece el botón «Deploy».
+
+### 7.3 Pruebas y comprobaciones ejecutadas
+
+- Focalizadas: `pytest crypto_scalper/dashboard/tests tests/test_dashboard_data.py tests/test_monitoring.py -q` → **35 passed** (33 anteriores + 2 nuevas: conservación de filtros ante base bloqueada/ausente y formato/valor nulo numérico).
+- Suite sin `slow`: `pytest -q -m "not slow"` → **413 passed, 1 deselected** en una única ejecución (7 warnings preexistentes de joblib/NumPy). El test `slow` no se ejecutó.
+- `pip check` → sin dependencias rotas. `git diff --check` → sin errores (solo avisos LF/CRLF de Git).
+
+### 7.4 Capturas
+
+Carpeta local, ignorada por Git (no se publica en GitHub):
+`logs/dashboard-validacion/capturas/`
+
+- `antes/`: los defectos encontrados (`None` y formato inglés, eje de drawdown, fracciones, KPI cortadas, barra lateral ausente con la base ocupada, filtro perdido tras el bloqueo, leyenda solapada en móvil, módulo retenido en 8501 frente a 8502).
+- `final/`: Resumen, gráficos, Historial con filtros y orden numérico, Señales, Riesgo, Logs, estado vacío, 800 px, móvil, base ocupada y ausente con los filtros conservados.
+- `final/04`, `05`, `07`, `09`, `10`, `11`, `12` y `15` se tomaron antes del último ajuste de la leyenda de Plotly. Las páginas sin gráfico no cambian; `final/01–03`, `06`, `08`, `13` y `14` reflejan el código final.
+
+### 7.5 Limitaciones y pendientes reales
+
+- Siguen en inglés controles nativos de Streamlit: menú principal, «Select all», «Clear value», barra de la tabla (buscar, descargar CSV, columnas), «Fullscreen», «Page not found», atributos de accesibilidad del calendario y «None» en celdas nulas. Streamlit no expone una traducción.
+- Las capturas usan datos sintéticos de la fixture (un solo día y marcas de milisegundos). No se ha revisado la legibilidad con históricos largos ni realizado una prueba de carga. Los presupuestos de 250 ms protegen al lector, pero no sustituyen una evaluación con datos representativos.
+- No hay validación de concurrencia con un bot real escribiendo. La condición WAL se mantiene: `mode=ro` no garantiza ausencia de bloqueo con journal `delete`.
+- Las limitaciones del esquema de la sección 5 siguen vigentes: modo no atribuible a posiciones/señales, equity solo de cartera, precio de salida solo si existe la orden y PnL bruto.
+- Con tarjetas sin delta (estado vacío), la de Exposición es algo más alta que las demás. Es un detalle estético menor.
+- El dashboard **no está certificado para producción**.
 
 ## 8. Prompt sugerido para Claude Code
 
@@ -216,8 +271,11 @@ La carpeta de origen es C:\Users\Jose Arturo\Documents\ChatGPT\binancebot;
 si trabajas en otro equipo, clona esa rama y crea un entorno virtual nuevo.
 Lee HANDOFF_PARA_CLAUDE_CODE.md y revisa el estado de Git antes de cambiar nada.
 Conserva cualquier cambio local posterior al commit del handoff.
-Retoma la validación pendiente del dashboard multipágina, empezando por un proceso
-limpio de Streamlit y las pruebas offline. No modifiques RiskEngine ni ExecutionEngine,
+La validación visual con datos sintéticos está registrada en la sección 7.
+Continúa con los pendientes reales de 7.5 que el usuario priorice (por ejemplo,
+revisión con una base representativa o con el bot en paper y WAL). Arranca
+Streamlit siempre como proceso nuevo con --server.fileWatcherType none y
+reinícialo tras cada cambio. No modifiques RiskEngine ni ExecutionEngine,
 no actives trading real y no amplíes el esquema de persistencia sin acordar ese alcance.
 Explica qué verificaste, qué corregiste y qué limitaciones siguen abiertas.
 ```

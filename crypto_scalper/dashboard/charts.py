@@ -33,16 +33,37 @@ SPANISH_LOCALE = {
 }
 
 
+# Day-first tick labels at every zoom level; Plotly's default is "sep 22, 2026".
+DATE_TICKS = [
+    dict(dtickrange=[None, 1_000], value="%H:%M:%S.%L"),
+    dict(dtickrange=[1_000, 60_000], value="%H:%M:%S<br>%d %b"),
+    dict(dtickrange=[60_000, 86_400_000], value="%H:%M<br>%d %b"),
+    dict(dtickrange=[86_400_000, "M1"], value="%d %b<br>%Y"),
+    dict(dtickrange=["M1", "M12"], value="%b %Y"),
+    dict(dtickrange=["M12", None], value="%Y"),
+]
+
+
+def date_axis(fig: go.Figure, title: str) -> None:
+    fig.update_xaxes(title_text=title, tickformatstops=DATE_TICKS, hoverformat="%d/%m/%Y %H:%M:%S UTC")
+
+
 def show(fig: go.Figure, key: str) -> None:
-    """Retain zoom across refreshes; reset when the global selection changes."""
+    """Retain zoom across refreshes; reset when the global selection changes.
+
+    The legend grows upwards from the plot area and Plotly widens the top
+    margin for wrapped rows, so in narrow windows it covers neither axis
+    labels nor the toolbar that touch screens always show.
+    """
     fig.update_layout(
-        height=360, margin=dict(l=20, r=20, t=30, b=20),
-        legend=dict(orientation="h", y=1.15),
+        height=380, margin=dict(l=20, r=20, t=70, b=20),
+        legend=dict(orientation="h", y=1.02, yanchor="bottom", x=0, xanchor="left"),
         uirevision=repr(st.session_state.get("dashboard_filters")),
         separators=",.", hovermode="x unified",
     )
     st.plotly_chart(fig, key=key, width="stretch", config={
         "displaylogo": False, "locale": "es", "locales": {"es": SPANISH_LOCALE},
+        "modeBarButtonsToRemove": ["select2d", "lasso2d", "zoomIn2d", "zoomOut2d", "autoScale2d"],
     })
 
 
@@ -65,9 +86,11 @@ def equity_chart(rows: list[Row]) -> None:
                                 mode="lines", name=f"Drawdown · {name}",
                                 line=dict(color=RED, dash=["dot", "dash", "dashdot"][index % 3]),
                                 hovertemplate="%{y:.2f}%<extra>%{fullData.name}</extra>"), secondary_y=True)
-    fig.update_xaxes(title_text="Fecha (UTC)")
+    date_axis(fig, "Fecha (UTC)")
     fig.update_yaxes(title_text="Capital (USDT)", secondary_y=False)
-    fig.update_yaxes(title_text="Drawdown (%)", rangemode="tozero", secondary_y=True)
+    # Explicit auto ticks: synced ticks produced labels such as 1,973 %.
+    fig.update_yaxes(title_text="Drawdown (%)", rangemode="tozero", tickmode="auto",
+                     showgrid=False, secondary_y=True)
     show(fig, "equity_chart")
     st.caption("Cartera completa · Hasta 2.001 puntos por modo, con primer y último registro. "
                "El muestreo puede omitir picos intermedios; el máximo de riesgo usa todos los registros.")
@@ -86,7 +109,8 @@ def pnl_chart(rows: list[Row]) -> None:
         name="PnL acumulado", hovertemplate="%{y:+,.2f} USDT<extra>PnL acumulado</extra>",
     ))
     fig.add_hline(y=0, line_color="#94a3b8", line_dash="dot")
-    fig.update_layout(xaxis_title="Fecha de cierre (UTC)", yaxis_title="PnL (USDT)")
+    date_axis(fig, "Fecha de cierre (UTC)")
+    fig.update_layout(yaxis_title="PnL (USDT)", showlegend=False)
     show(fig, "pnl_chart")
     st.caption("Suma desde cero dentro del intervalo, por fecha de cierre. "
                "PnL bruto persistido en positions; no descuenta comisiones ni financiación.")
@@ -106,7 +130,11 @@ def signal_chart(rows: list[Row]) -> None:
         fig.add_trace(go.Bar(x=[DIRECTIONS.get(d, d) for d in directions], y=counts, name=name,
                             marker_color=color, customdata=[100 * n / total for n in counts],
                             hovertemplate="%{x}: %{y} (%{customdata:.1f}% del total)<extra>%{fullData.name}</extra>"))
-    fig.update_layout(barmode="stack", xaxis_title="Dirección", yaxis_title="Número de señales")
+    fig.update_layout(barmode="stack", xaxis_title="Dirección", yaxis_title="Número de señales",
+                      legend_traceorder="normal")
+    tallest = max(sum(r["count"] for r in rows if r["signal_type"] == d) for d in directions)
+    if tallest <= 10:  # Counts are whole numbers; avoid ticks such as 0,5.
+        fig.update_yaxes(dtick=1)
     show(fig, "signal_chart")
     st.caption("*Aprobadas: LONG/SHORT elegibles sin rechazo registrado. No implica una orden ejecutada. "
                "Se incluyen señales neutras y rechazos posteriores a la elegibilidad.")
@@ -121,8 +149,12 @@ def exposure_chart(rows: list[Row]) -> None:
     fig = go.Figure()
     for side, color in [("BUY", BLUE), ("SELL", "#d97706")]:
         values = [r for r in rows if r["side"] == side]
+        if not values:
+            continue
         fig.add_trace(go.Bar(x=[r["symbol"] for r in values], y=[r["exposure"] for r in values],
                             name=DIRECTIONS[side], marker_color=color,
                             hovertemplate="%{x}: %{y:,.2f} USDT<extra>%{fullData.name}</extra>"))
-    fig.update_layout(barmode="stack", xaxis_title="Símbolo", yaxis_title="Nominal bruto (USDT)")
+    # Keep the LONG/SHORT legend even when only one direction is open.
+    fig.update_layout(barmode="stack", xaxis_title="Símbolo", yaxis_title="Nominal bruto (USDT)",
+                      showlegend=True)
     show(fig, "exposure_chart")

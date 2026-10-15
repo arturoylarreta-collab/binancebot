@@ -267,7 +267,7 @@ Desde la raíz del repositorio, con Python 3.11 o posterior:
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 $env:DASHBOARD_DB_PATH = "C:\ruta\al\bot\logs\paper.db"
-.\.venv\Scripts\python.exe -m streamlit run crypto_scalper/dashboard/app.py --server.address 127.0.0.1
+.\.venv\Scripts\python.exe -m streamlit run crypto_scalper/dashboard/app.py --server.address 127.0.0.1 --server.fileWatcherType none --client.toolbarMode viewer
 ```
 
 En Linux/macOS, después de crear el entorno:
@@ -275,7 +275,25 @@ En Linux/macOS, después de crear el entorno:
 ```bash
 .venv/bin/python -m pip install -e '.[dev]'
 export DASHBOARD_DB_PATH=/ruta/al/bot/logs/paper.db
-.venv/bin/python -m streamlit run crypto_scalper/dashboard/app.py --server.address 127.0.0.1
+.venv/bin/python -m streamlit run crypto_scalper/dashboard/app.py --server.address 127.0.0.1 --server.fileWatcherType none --client.toolbarMode viewer
+```
+
+- `--server.fileWatcherType none` desactiva la recarga en caliente. Un servidor
+  de desarrollo que sigue abierto mientras se editan los módulos puede quedarse
+  con una versión antigua de `common.py`/`charts.py` y ejecutar páginas nuevas
+  contra ella (así se produjo el `AttributeError ... require_entrypoint`).
+  Sin vigilante, el proceso ejecuta siempre el código con el que arrancó:
+  **reinícialo después de actualizar el código**.
+- `--client.toolbarMode viewer` oculta el botón «Deploy» y las opciones de
+  desarrollador del menú de Streamlit, que no aplican a los socios.
+- Versión verificada visualmente: Streamlit 1.64.0, Plotly 6.9.0.
+
+Para probar la interfaz sin el bot, genera una base **sintética** con la misma
+fixture de los tests (solo la crea si no existe; `logs/` está fuera de Git):
+
+```powershell
+.\.venv\Scripts\python.exe -c "from pathlib import Path; from crypto_scalper.dashboard.tests.conftest import database; p=Path('logs/dashboard-preview'); p.mkdir(parents=True, exist_ok=True); database.__wrapped__(p) if not (p/'sesión #1.db').exists() else None"
+$env:DASHBOARD_DB_PATH = (Resolve-Path -LiteralPath 'logs/dashboard-preview/sesión #1.db').Path
 ```
 
 Abre [el dashboard local](http://localhost:8501). La ruta predeterminada es
@@ -291,8 +309,10 @@ comparten los resultados cacheados cuando seleccionan los mismos filtros.
 - **Resumen:** capital y drawdown con ejes separados, PnL realizado acumulado,
   distribución LONG/SHORT/NEUTRA y aprobaciones/rechazos, y cuatro KPIs.
 - **Historial de trades:** precios de entrada/salida, dirección, PnL bruto, causa
-  y fecha de cierre. Un precio de salida vacío significa que falta la orden
-  ejecutada; no se infiere un precio artificial a partir del resultado.
+  y fecha de cierre. Si falta la orden de salida ejecutada, la celda queda sin
+  valor y la tabla nativa la muestra como «None» (Streamlit no permite cambiar
+  ese texto sin convertir la columna en texto y perder el orden numérico). No
+  se infiere un precio artificial a partir del resultado.
 - **Señales y rechazos:** score, dirección, elegibilidad, motivo y fecha. Una
   señal elegible con rechazo posterior cuenta como rechazada en el gráfico.
   «Aprobada» significa elegible LONG/SHORT sin rechazo registrado; no demuestra
@@ -308,7 +328,17 @@ fecha de cierre para trades/PnL, de apertura para posiciones abiertas y de
 registro para señales, eventos y heartbeats. El rango es fijo: amplía su final
 para incluir días nuevos cuando dejes abierta una sesión durante varios días.
 Vaciar la selección de símbolos significa «Todos». Los filtros se conservan al
-navegar porque se renderizan una sola vez en el punto de entrada.
+navegar porque se renderizan una sola vez en el punto de entrada, y también
+cuando un refresco no puede leer la base (bloqueada o ausente): la selección y
+la pausa del refresco se restauran al recuperarse.
+
+Los números propios del dashboard usan separadores españoles (`1.020,00`,
+`2,00 %`) en KPIs, tablas y gráficos; las tablas siguen ordenando por el valor
+numérico. Son nativos de Streamlit, y pueden aparecer en inglés, el menú
+principal, «Select all» del selector de símbolos, «Clear value», la barra de
+la tabla (buscar, descargar CSV, columnas), «Fullscreen», el diálogo «Page not
+found» de una URL inexistente, los atributos de accesibilidad del calendario y
+«None» en celdas sin valor. Streamlit no expone una traducción de esos textos.
 
 Las tablas permiten ordenar cualquier columna, conservando precios y fechas
 como valores tipados. Muestran hasta 100/500/1.000/5.000 filas recientes, según
@@ -367,8 +397,11 @@ zoom de Plotly se conserva entre refrescos con los mismos filtros.
 
 Las pruebas usan bases temporales y `unittest.mock`, validan las consultas,
 límites UTC, modo ambiguo, PnL, exposición sin cierres, protección de escritura,
-caché/expiración, cierre de conexiones y navegación con filtros compartidos.
-`AppTest` ejecuta las cinco páginas sin abrir un servidor ni conectar a Binance.
+caché/expiración, cierre de conexiones, navegación con filtros compartidos,
+conservación de filtros ante una base bloqueada o ausente y formato numérico.
+`AppTest` ejecuta las cinco páginas sin abrir un servidor ni conectar a Binance;
+complementa, pero no sustituye, la revisión visual en navegador descrita en
+`HANDOFF_PARA_CLAUDE_CODE.md`.
 
 ## Configuración aplicada por defecto
 

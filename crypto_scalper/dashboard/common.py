@@ -6,11 +6,14 @@ from contextlib import closing
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Literal
 
+import pandas as pd
 import streamlit as st
 
 from crypto_scalper.monitoring import dashboard_data as dd
 
 View = Literal["summary", "trades", "signals", "risk", "logs"]
+WIDGET_KEYS = ("filter_dates", "filter_symbols", "filter_mode", "table_limit", "auto_refresh")
+MISSING = "—"
 MODE_LABELS = {None: "Todos", "backtest": "Backtest", "paper": "Simulación (paper)", "live": "En vivo (live)"}
 DIRECTIONS = {"BUY": "LONG", "SELL": "SHORT", "FLAT": "NEUTRA"}
 REASONS = {
@@ -85,13 +88,22 @@ def sidebar(db_path: str, options: dd.Row) -> dd.DashboardFilters:
     today = datetime.now(timezone.utc).date()
     first = utc_date(options["min_ts_ms"]) if options["min_ts_ms"] else today
     last = max(today, utc_date(options["max_ts_ms"])) if options["max_ts_ms"] else today
+    # Defaults live in Session State, not in widget arguments, so restoring
+    # preserved values never triggers Streamlit's default/state conflict warning.
+    st.session_state.setdefault("filter_dates", (first, last))
+    st.session_state.setdefault("table_limit", 1_000)
+    st.session_state.setdefault("auto_refresh", True)
+    selected = st.session_state.get("filter_symbols", [])
+    if any(symbol not in options["symbols"] for symbol in selected):
+        st.session_state["filter_symbols"] = [s for s in selected if s in options["symbols"]]
     with st.sidebar:
         st.header("Filtros globales")
-        dates = st.date_input("Rango de fechas (UTC)", value=(first, last), key="filter_dates", format="DD/MM/YYYY")
+        dates = st.date_input("Rango de fechas (UTC)", key="filter_dates", format="DD/MM/YYYY")
         symbols = st.multiselect("Símbolos", options["symbols"], key="filter_symbols", placeholder="Todos los símbolos")
-        mode = st.selectbox("Modo", [None, *dd.MODES], format_func=lambda m: MODE_LABELS[m], key="filter_mode")
-        st.selectbox("Filas por tabla", [100, 500, 1_000, 5_000], index=2, key="table_limit")
-        st.toggle("Actualizar cada 5 segundos", value=True, key="auto_refresh")
+        mode = st.selectbox("Modo", [None, *dd.MODES], format_func=lambda m: MODE_LABELS[m],
+                            key="filter_mode", placeholder="Todos")
+        st.selectbox("Filas por tabla", [100, 500, 1_000, 5_000], format_func=number, key="table_limit")
+        st.toggle("Actualizar cada 5 segundos", key="auto_refresh")
         st.caption("Desactiva el refresco para explorar las tablas con calma. Los filtros se conservan al navegar.")
     if len(dates) != 2:
         st.info("Selecciona la fecha inicial y la final para consultar los datos.")
@@ -124,15 +136,33 @@ def require_entrypoint(filename: str) -> None:
     restore the intended page so all reads always use initialized filters.
     """
     if not st.session_state.get("_dashboard_entrypoint_running", False):
-        # A redirect ends a run without rendering its widgets. Save their
-        # values under a non-widget key before Streamlit cleans them up.
-        st.session_state["_dashboard_saved_widgets"] = {
-            key: st.session_state[key]
-            for key in ("filter_dates", "filter_symbols", "filter_mode", "table_limit", "auto_refresh")
-            if key in st.session_state
-        }
+        preserve_widgets()
         st.session_state["_dashboard_requested_page"] = filename
         st.switch_page("app.py")
+
+
+def preserve_widgets() -> None:
+    """Keep sidebar selections across a run that ends before rendering them.
+
+    Streamlit discards the state of widgets not rendered in a run: a redirect,
+    a missing database or a locked read would otherwise reset the filters and
+    resume a paused refresh. Only call it when the sidebar was not rendered,
+    so a newer user selection is never overwritten. app.py restores them.
+    """
+    st.session_state["_dashboard_saved_widgets"] = {
+        key: st.session_state[key] for key in WIDGET_KEYS if key in st.session_state
+    }
+
+
+def number(value: float, decimals: int = 0, sign: bool = False) -> str:
+    """Spanish separators (1.234,56), matching the Plotly figures."""
+    value = 0.0 if round(value, decimals) == 0 else value  # never show -0,00
+    text = f"{value:{'+' if sign else ''},.{decimals}f}"
+    return text.replace(",", "\0").replace(".", ",").replace("\0", ".")
+
+
+def percent(fraction: float, decimals: int = 2, sign: bool = False) -> str:
+    return f"{number(fraction * 100, decimals, sign)} %"
 
 
 def timestamp(ts_ms: int) -> datetime | None:
@@ -143,45 +173,66 @@ def timestamp(ts_ms: int) -> datetime | None:
 def reason(value: str | None) -> str:
     """Translate known reasons and preserve unknown audit codes verbatim."""
     if not value:
-        return "—"
+        return MISSING
     code, sep, detail = value.partition(":")
     return REASONS.get(code, code) + (f": {REASONS.get(detail.strip(), detail.strip())}" if sep else "")
 
 
-def table(rows: list[dd.Row], key: str, numeric: tuple[str, ...] = ()) -> None:
+def styled(rows: list[dd.Row], decimals: dict[str, int]) -> Any:
+    """Spanish separators for display only; cells stay numeric, so sorting is numeric.
+
+    Unknown values stay null. Streamlit 1.64 always paints null cells with a
+    fixed «None» label (no option to change it); converting them to text
+    would sort prices alphabetically, so captions name that label instead.
+    """
+    styler = pd.DataFrame(rows).style
+    for column, places in decimals.items():
+        styler = styler.format(precision=places, decimal=",", thousands=".", subset=[column])
+    return styler
+
+
+def table(rows: list[dd.Row], key: str, decimals: dict[str, int] | None = None) -> None:
     """Sortable, read-only dataframe with typed numeric/date cells and stable key."""
     if not rows:
         st.info("No hay registros para los filtros seleccionados.")
         return
-    config: dict[str, Any] = {column: st.column_config.NumberColumn(format="%.4f") for column in numeric}
-    config["Fecha"] = st.column_config.DatetimeColumn(format="DD/MM/YYYY HH:mm:ss", timezone="UTC")
-    st.dataframe(rows, hide_index=True, width="stretch", column_config=config, key=key)
-    limit = st.session_state["table_limit"]
-    st.caption(f"{len(rows):,} filas mostradas · Máximo: {limit:,}, las más recientes. "
+    config: dict[str, Any] = {"Fecha": st.column_config.DatetimeColumn(format="DD/MM/YYYY HH:mm:ss", timezone="UTC")}
+    st.dataframe(styled(rows, decimals or {}), hide_index=True, width="stretch", column_config=config, key=key)
+    shown = "1 fila mostrada" if len(rows) == 1 else f"{number(len(rows))} filas mostradas"
+    st.caption(f"{shown} · Máximo: {number(st.session_state['table_limit'])}, las más recientes. "
                "Pulsa cualquier encabezado para ordenar las filas cargadas. Fechas en UTC.")
 
 
 def kpis(data: dd.Row) -> None:
-    """Portfolio capital/drawdown and filtered win rate/current open exposure."""
+    """Portfolio capital/drawdown and filtered win rate/current open exposure.
+
+    A wrapping row keeps labels readable in narrow windows instead of
+    truncating four fixed columns. Deltas add context instead of repeating values.
+    """
     status, risk, history = data["status"], data["risk"], data["equity"]
     valid = "error" not in status
     same_mode = [r for r in history if r["mode"] == status.get("mode")]
     change = status["equity"] - same_mode[0]["equity"] if valid and same_mode else None
-    capital, drawdown, win_rate, exposure = st.columns(4)
-    with capital:
-        st.metric("Capital (USDT)", f"{status['equity']:,.2f}" if valid else "—",
-                  delta=f"{change:+,.2f} USDT" if change is not None else None,
-                  border=True, help="Último heartbeat de cartera. Cambio frente al primero del mismo modo en el intervalo.")
-    with drawdown:
-        st.metric("Drawdown", f"{status['drawdown_pct'] * 100:.2f}%" if valid else "—",
-                  delta=f"{-status['drawdown_pct'] * 100:.2f}% desde el máximo" if valid else None,
-                  border=True, help="Caída de toda la cartera guardada por el bot; no se recalcula por símbolo.")
-    with win_rate:
-        st.metric("Tasa de acierto", f"{risk['win_rate'] * 100:.1f}%" if risk["total_trades"] else "—",
-                  delta=f"{risk['realized_pnl']:+,.2f} USDT" if risk["total_trades"] else None,
-                  border=True, help="Trades con PnL positivo / trades cerrados del filtro. El indicador muestra su PnL total.")
-    with exposure:
-        st.metric("Exposición (USDT)", f"{risk['total_exposure']:,.2f}", border=True,
+    max_dd = risk["max_drawdown_pct"]
+    pnl = risk["realized_pnl"]
+    opened = risk["open_count"]
+    with st.container(horizontal=True, gap="small"):
+        st.metric("Capital (USDT)", number(status["equity"], 2) if valid else MISSING,
+                  delta=f"{number(change, 2, sign=True)} USDT" if change is not None else None,
+                  delta_color="normal" if change else "off", border=True, width=220, height="stretch",
+                  help="Último heartbeat de cartera. Cambio frente al primero del mismo modo en el intervalo.")
+        st.metric("Drawdown", percent(status["drawdown_pct"]) if valid else MISSING,
+                  delta=f"-{percent(max_dd)} máx. del período" if valid and max_dd > 0 else None,
+                  border=True, width=220, height="stretch",
+                  help="Caída actual de toda la cartera guardada por el bot; no se recalcula por símbolo. "
+                       "El indicador muestra el máximo del intervalo filtrado.")
+        st.metric("Tasa de acierto", percent(risk["win_rate"], 1) if risk["total_trades"] else MISSING,
+                  delta=f"{number(pnl, 2, sign=True)} USDT de PnL" if risk["total_trades"] else None,
+                  delta_color="normal" if round(pnl, 2) else "off", border=True, width=220, height="stretch",
+                  help="Trades con PnL positivo / trades cerrados del filtro. El indicador muestra su PnL bruto total.")
+        st.metric("Exposición (USDT)", number(risk["total_exposure"], 2),
+                  delta="1 posición abierta" if opened == 1 else f"{number(opened)} posiciones abiertas",
+                  delta_color="off", delta_arrow="off", border=True, width=220, height="stretch",
                   help="Nominal bruto de posiciones actualmente abiertas cuya apertura cumple los filtros; no es exposición histórica.")
     if valid:
         state = {"running": "En ejecución", "stopped": "Detenido", "paused": "Pausado"}.get(status["status"], status["status"])
