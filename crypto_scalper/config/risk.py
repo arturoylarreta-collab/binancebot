@@ -42,6 +42,10 @@ class RiskConfig:
     )
     minimum_required_edge_pct: float = 0.0015  # after costs, FASE 5 uses this
     min_cost_edge_ratio: float = 1.5
+    # Stop distance clamp as a fraction of entry. For live scalping the minimum
+    # should comfortably exceed round-trip fees (2 × 0.04% taker ≈ 0.08%).
+    min_stop_pct: float = 0.0005
+    max_stop_pct: float = 0.05
 
     def __post_init__(self) -> None:
         if not (0 < self.risk_per_trade_pct <= ABSOLUTE_MAX_RISK_PER_TRADE_PCT):
@@ -60,6 +64,8 @@ class RiskConfig:
             raise ConfigurationError("max_drawdown_pct must be in (0, 0.25]")
         if self.max_positions < 1:
             raise ConfigurationError("max_positions must be >= 1")
+        if not 0 < self.min_stop_pct < self.max_stop_pct <= 0.2:
+            raise ConfigurationError("require 0 < min_stop_pct < max_stop_pct <= 0.2")
 
 
 @dataclass(frozen=True)

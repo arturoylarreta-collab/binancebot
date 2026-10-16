@@ -257,7 +257,8 @@ class TestPortfolioRebuild:
                 equity=9900.0, initial_equity=10000.0, peak_equity=10000.0,
             )
             assert portfolio.open_count == 0
-            assert portfolio.daily_realized_pnl == pytest.approx(-1000.0)
+            assert pos.realized_pnl == pytest.approx(-1000.0)  # gross
+            assert portfolio.daily_realized_pnl == pytest.approx(-1000.0 - pos.fees)  # net of fees
             assert portfolio.consecutive_losses == 1
             assert portfolio.total_risk_pct == 0.0
         finally:

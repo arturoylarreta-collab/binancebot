@@ -21,6 +21,21 @@ def test_closed_history_and_actual_exit_price(conn, selection):
     assert dd.risk_metrics(conn, selection)["win_rate"] == 0.5
 
 
+def test_persisted_exit_price_wins_and_zero_means_unknown(database, conn, selection):
+    """FASE 9 schema: positions.exit_price, where 0 is the legacy 'unknown'."""
+    with closing(sqlite3.connect(database)) as writer:
+        writer.execute("ALTER TABLE positions ADD COLUMN exit_price REAL NOT NULL DEFAULT 0")
+        writer.execute("UPDATE positions SET exit_price=101.5 WHERE position_id='b'")
+        writer.commit()
+    rows = {r["position_id"]: r["exit_price"] for r in dd.trade_history(conn, selection)}
+    assert rows == {"b": 101.5, "a": 112.5}  # persisted value; else the filled order
+    with closing(sqlite3.connect(database)) as writer:
+        writer.execute("DELETE FROM orders")
+        writer.execute("UPDATE positions SET exit_price=0")
+        writer.commit()
+    assert [r["exit_price"] for r in dd.trade_history(conn, selection)] == [None, None]
+
+
 def test_filters_apply_to_every_query(conn, selection):
     btc = replace(selection, symbols=("BTCUSDT",))
     assert [r["position_id"] for r in dd.trade_history(conn, btc)] == ["a"]

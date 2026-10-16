@@ -1,0 +1,52 @@
+# Render Blueprint — the bot + its embedded dashboard as one web service.
+#
+# Free plan: no persistent disk and the instance sleeps after 15 min without
+# inbound traffic. Both are handled in code:
+#   * KEEPALIVE_URL (defaults to RENDER_EXTERNAL_URL) self-pings /healthz;
+#   * FIREBASE_SERVICE_ACCOUNT_JSON enables the Firestore (Firebase Spark)
+#     mirror, so account state, trades and the equity curve survive restarts.
+# Secrets (sync: false) are entered by you in the Render dashboard, never here.
+services:
+  - type: web
+    name: crypto-scalper
+    runtime: docker
+    region: frankfurt          # Binance blocks US IPs (HTTP 451)
+    plan: free
+    branch: main
+    autoDeploy: true
+    healthCheckPath: /healthz
+    envVars:
+      - key: EXECUTION_VENUE
+        value: testnet         # falls back to paper until valid keys exist
+      - key: SYMBOLS
+        value: BTCUSDT,ETHUSDT,SOLUSDT
+      - key: PAPER_DB_PATH
+        value: /tmp/bot.db
+      - key: PAPER_START_EQUITY
+        value: "10000"
+      - key: RISK_MAX_RISK_PER_TRADE_PCT
+        value: "0.005"
+      - key: RISK_MIN_STOP_PCT
+        value: "0.0025"
+      - key: RISK_MAX_LEVERAGE
+        value: "2"
+      - key: EXECUTION_DEFAULT_RR_RATIO
+        value: "1.8"
+      - key: STRATEGY_LONG_THRESHOLD
+        value: "58"
+      - key: STRATEGY_SHORT_THRESHOLD
+        value: "42"
+      - key: DASHBOARD_CONTROL_TOKEN
+        generateValue: true
+      - key: BINANCE_TESTNET_API_KEY
+        sync: false
+      - key: BINANCE_TESTNET_API_SECRET
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: DASHBOARD_PASSWORD
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
