@@ -106,9 +106,12 @@ class RiskEngine:
             )
 
         # ── 2. Daily loss limit ──────────────────────────────────────
+        # Denominator is start-of-day equity (equity before today's realized PnL),
+        # otherwise the limit loosens as losses shrink current equity.
         daily_loss_pct = 0.0
-        if portfolio.equity > 0:
-            daily_loss_pct = abs(min(0.0, portfolio.daily_realized_pnl)) / portfolio.equity
+        day_start_equity = portfolio.equity - portfolio.daily_realized_pnl
+        if day_start_equity > 0:
+            daily_loss_pct = abs(min(0.0, portfolio.daily_realized_pnl)) / day_start_equity
         daily_ok = daily_loss_pct < self._config.daily_loss_limit_pct
         checks["daily_loss_limit"] = daily_ok
         if not daily_ok:
@@ -136,7 +139,7 @@ class RiskEngine:
         if portfolio.consecutive_losses >= cl.pause_after:
             return self._decision(
                 signal.symbol, now_ms, RiskVerdict.TRADING_HALTED,
-                RejectReason.KILL_SWITCH, checks,
+                RejectReason.CONSECUTIVE_LOSSES, checks,
                 details={"consecutive_losses": portfolio.consecutive_losses,
                          "pause_after": cl.pause_after},
             )
@@ -185,11 +188,44 @@ class RiskEngine:
         )
         sl_price = sl.stop_price
         stop_distance = sl.stop_distance
+        # No entry price / no ATR → no valid stop → never size a trade.
+        checks["stop_loss_valid"] = sl.method != "invalid" and sl_price > 0 and stop_distance > 0
+        if not checks["stop_loss_valid"]:
+            return self._decision(
+                signal.symbol, now_ms, RiskVerdict.REJECTED,
+                RejectReason.DATA_NOT_READY, checks,
+                details={"entry_price": _entry, "atr": atr},
+            )
 
         sizing = self._sizer.calculate(
             portfolio.equity, _entry, sl_price, _side,
             tick_size=tick_size, lot_size=lot_size,
         )
+
+        # Portfolio-level leverage: the per-trade cap alone lets N positions
+        # each use equity × leverage (N× gross exposure). Shrink the new trade
+        # to the headroom left under equity × max_leverage.
+        open_notional = sum(float(p.notional_value or 0.0) for p in portfolio.open_positions)
+        headroom = portfolio.equity * self._config.max_leverage - open_notional
+        checks["gross_leverage"] = headroom > 0
+        if sizing.quantity > 0 and _entry > 0 and sizing.notional_value > headroom:
+            import dataclasses as _dc
+            import math as _math
+            qty = max(0.0, headroom) / _entry
+            if lot_size > 0:
+                qty = _math.floor(qty / lot_size + 1e-9) * lot_size
+            sizing = _dc.replace(
+                sizing, quantity=round(qty, 10), notional_value=round(qty * _entry, 10),
+                risk_amount=round(qty * stop_distance, 10), capped=True,
+                cap_reason="gross_leverage_cap",
+            )
+            if qty <= 0:
+                return self._decision(
+                    signal.symbol, now_ms, RiskVerdict.REJECTED,
+                    RejectReason.RISK_EXPOSURE_EXCEEDED, checks,
+                    details={"open_notional": round(open_notional, 2),
+                             "max_gross": round(portfolio.equity * self._config.max_leverage, 2)},
+                )
 
         checks["position_sizing"] = sizing.quantity > 0
         if sizing.quantity <= 0:

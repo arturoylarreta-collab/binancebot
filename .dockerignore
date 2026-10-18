@@ -1,0 +1,14 @@
+.git
+.venv
+**/__pycache__
+**/*.pyc
+.pytest_cache
+logs
+data
+models
+*.db
+*.db-*
+.env
+.env.*
+tests
+HANDOFF_*.md

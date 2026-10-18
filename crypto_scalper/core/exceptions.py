@@ -135,6 +135,14 @@ class DuplicateOrderError(ExecutionError):
     pass
 
 
+class OrderNotFoundError(ExecutionError):
+    """The venue has no order with that client_order_id (Binance -2011/-2013)."""
+
+
+class AlreadyFlatError(ExecutionError):
+    """Reduce-only order with nothing to reduce (Binance -2022): position is flat."""
+
+
 class PositionNotProtectedError(ExecutionError, Fatal):
     pass
 

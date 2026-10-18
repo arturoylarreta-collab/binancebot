@@ -64,9 +64,41 @@ class TestOrderBookGap:
     def test_pu_mismatch_detected(self):
         ob = OrderBook("BTCUSDT")
         ob.apply_snapshot(100, [["100", "1"]], [["101", "1"]], ts_ms=1)
-        ev = diff("BTCUSDT", first=101, final=101, pu=99)  # inconsistent prev
+        ob.apply_diff(diff("BTCUSDT", first=101, final=101, pu=100))
+        ev = diff("BTCUSDT", first=103, final=104, pu=102)  # skipped u=102
         ob.apply_diff(ev)
         assert ob.sync_required is True
+        assert ob.last_update_id == 101
+
+    def test_first_event_straddles_snapshot(self):
+        # Binance futures: the first event only needs U <= lastUpdateId <= u;
+        # its pu refers to a pre-snapshot event and must NOT be checked.
+        ob = OrderBook("BTCUSDT")
+        ob.apply_snapshot(105, [["100", "1"]], [["101", "1"]], ts_ms=1)
+        ob.apply_diff(diff("BTCUSDT", first=100, final=110, pu=95, bids=(("99", "2"),)))
+        assert ob.sync_required is False
+        assert ob.last_update_id == 110
+        ob.apply_diff(diff("BTCUSDT", first=111, final=112, pu=110))
+        assert ob.is_synced and ob.last_update_id == 112
+
+    def test_resync_buffers_diffs_in_flight(self):
+        ob = OrderBook("BTCUSDT")
+        ob.apply_snapshot(100, [["100", "1"]], [["101", "1"]], ts_ms=1)
+        ob.begin_resync()
+        assert not ob.has_snapshot and not ob.is_synced
+        ob.apply_diff(diff("BTCUSDT", first=190, final=199, pu=189))   # stale vs new snapshot
+        ob.apply_diff(diff("BTCUSDT", first=200, final=210, pu=199, bids=(("99", "4"),)))
+        ok = ob.apply_snapshot(205, [["100", "1"]], [["101", "1"]], ts_ms=2)
+        assert ok and ob.last_update_id == 210
+        assert ob.metrics().bid_depth == 5.0
+
+    def test_no_apply_while_out_of_sync(self):
+        ob = OrderBook("BTCUSDT")
+        ob.apply_snapshot(100, [["100", "1"]], [["101", "1"]], ts_ms=1)
+        ob.apply_diff(diff("BTCUSDT", first=150, final=151, pu=149))  # gap
+        assert ob.sync_required
+        ob.apply_diff(diff("BTCUSDT", first=152, final=152, pu=151, bids=(("99", "9"),)))
+        assert ob.last_update_id == 100
 
     def test_buffered_events_replayed_after_snapshot(self):
         ob = OrderBook("BTCUSDT")

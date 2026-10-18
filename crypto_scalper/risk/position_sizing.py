@@ -99,9 +99,8 @@ class PositionSizer:
             capped = True
             cap_reason = "leverage_cap"
 
-        if tick_size > 0 and raw_qty > 0:
-            steps = math.floor(raw_qty / tick_size + 1e-9)
-            raw_qty = steps * tick_size
+        # tick_size is a PRICE increment and never applies to quantity; the
+        # quantity only snaps (down, so risk never exceeds budget) to lot_size.
         if lot_size > 0 and raw_qty > 0:
             steps = math.floor(raw_qty / lot_size + 1e-9)
             raw_qty = steps * lot_size

@@ -1,24 +1,21 @@
 # crypto_scalper — quantitative, async, modular crypto scalping system
 
-Status: **FASE 1 (arquitectura/riesgo) + FASE 2 (ingesta de datos) + FASE 3 (motor de features y señales) + FASE 4 (filtro ML) + FASE 5 (Risk Engine) + FASE 6 (Execution Engine offline) + FASE 7 (Paper Trading offline) implementadas.**
+Status: **FASES 1-8.5 + FASE 9 (auditoría, adapter Binance Futures Testnet, operación 24/7 y dashboard web embebido).** Ver [`HANDOFF_FASE9.md`](HANDOFF_FASE9.md) para la auditoría completa.
 
-FASE 2-4 producen un `FeatureSnapshot` estructurado por activo con features por
-categoría, un `Signal` Score 0-100 con desglose por dimensión y una dimensión
-`ml` alimentada por un clasificador probabilístico ensayado offline con walk-forward
-validation. La **FASE 5 añade el Risk Engine**: autoridad final sobre cada Signal
-(aprueba o rechaza por límites duros de riesgo, position sizing por riesgo y SL/TP
-obligatorios), sin red y determinista. La **FASE 6 añade el Execution Engine offline**:
-única capa que ejecuta un `RiskDecision` APPROVED con `ExchangeAdapter` +
-`SimulatedExecutionAdapter`, `OrderManager`, `PositionManager` (secuencia obligatoria
-Entry → Fill → Protección → Active, nunca activa sin SL+TP resting), `ExecutionRouter`
-(el riesgo manda: solo APPROVED llega al venus) y `ReconciliationEngine`. La **FASE 7
-añade el Paper Trading offline**: `TradeOrchestrator` (ciclo señal→riesgo→ejecución con
-equity mark-to-market de `PaperAccount`, guard por símbolo y pausa ante errores Fatales),
-persistencia SQLite idempotente del audit trail (`SqliteRepository`), `PeriodicReconciler`
-que mitiga la deriva venue-interno (cierra posiciones desprotegidas, cancela huérfanas,
-aplana no-trackeadas) y `PaperTradingEngine` + `--mode paper` para simular sesiones.
-Es 100% simulado e idempotente: **no hay conexión real ni órdenes reales** (eso es una
-fase posterior con un adapter LIVE).
+**Arranque rápido**
+
+```powershell
+pip install -r requirements-dev.txt
+python -m pytest -q                                    # 433 tests, sin red
+python -m crypto_scalper.main --mode paper --symbols BTCUSDT,ETHUSDT,SOLUSDT
+# → dashboard en http://localhost:8080/  ·  salud en /healthz
+```
+
+- `EXECUTION_VENUE=paper` (default): datos de mercado reales + ejecución simulada.
+- `EXECUTION_VENUE=testnet` + `BINANCE_TESTNET_API_KEY/SECRET`: **órdenes reales en la
+  cuenta demo** de Binance Futures (SL/TP vía Algo Service). El dinero real no es
+  seleccionable.
+- Despliegue 24/7: `Dockerfile` + `render.yaml` (Render, Frankfurt, disco persistente).
 
 ---
 
@@ -68,7 +65,8 @@ crypto_scalper/
                      alertas de transiciones SL/TP, halt de riesgo con cooldown, marks
                      para pnl_unrealized, heartbeat), dashboard_data (agregaciones puras
                      sobre SQLite para el dashboard)  [FASE 8.5]
-  dashboard/         app.py — Streamlit independiente que lee SOLO la DB  [FASE 8.5]
+  dashboard/         app.py — Resumen y navegación multipágina, filtros globales,
+                     gráficos Plotly, caché de 4 s y refresco de 5 s; SOLO SQLite
   main.py            pipeline en tiempo real + modos one-shot / signal / paper / backtest
 ```
 
@@ -208,12 +206,12 @@ El modo paper construye el pipeline real (WebSocket → Features → Signal), ej
 `on_price`/`on_signal` contra el `SimulatedExecutionAdapter`, reconcilia en
 cadencia y deja el audit trail en el SQLite de `PAPER_DB_PATH` (`logs/paper.db`).
 
-6) **Alertas Telegram + dashboard** (FASE 8.5 — en tu `.env` local, gitignored):
+6) **Alertas Telegram + dashboard** (en tu `.env` local, gitignored):
 
 ```powershell
 # .env: token/chat de tu bot (BotFather) + MONITORING_TELEGRAM_ENABLED=true
 python -m crypto_scalper.main --mode paper --symbols BTCUSDT
-streamlit run crypto_scalper/dashboard/app.py   # lee logs/paper.db (DASHBOARD_DB_PATH)
+# el dashboard lo sirve el propio bot: http://localhost:8080/
 ```
 
 El `TelegramNotifier` es fire-and-forget (nunca bloquea el ciclo de ejecución); si
@@ -223,6 +221,189 @@ equity/drawdown/exposición, posiciones abiertas, señales recientes y métricas
 
 7) **Entornos**: copia `.env.example` a `.env` (dev), o crea `.env.<APP_ENV>`.
    El modo LIVE bloquea el arranque si no existe `LIVE_TRADING_ENABLED=true`.
+
+## Dashboard interactivo multipágina
+
+El dashboard Streamlit se ejecuta como **proceso independiente** del bot. No
+importa sus motores ni llama a Binance; todos los datos de negocio proceden de
+SQLite. Convive con el dashboard web que el propio bot sirve en el puerto 8080
+(FASE 9): ambos leen la misma base y comparten `monitoring/dashboard_data.py`.
+
+### Diagnóstico del dashboard anterior
+
+1. La interfaz, las lecturas y la presentación estaban concentradas en una sola
+   página, sin filtros compartidos, caché ni actualización automática.
+2. Las conexiones se abrían en cada ejecución sin cierre explícito. Además, la
+   función de riesgo devolvía exposición cero si no había operaciones cerradas,
+   aunque hubiera posiciones abiertas.
+3. No se explicaban las limitaciones del esquema: capital global, modo ausente
+   en posiciones/señales, precio de salida fuera de `positions` y logs de texto
+   distintos de los eventos persistidos. Ahora estas diferencias son visibles.
+
+### Estructura
+
+```text
+crypto_scalper/
+  monitoring/dashboard_data.py       # Consultas SQL parametrizadas, sin Streamlit
+  dashboard/
+    app.py                           # Resumen, st.navigation y auto-refresco
+    common.py                        # Caché, filtros UTC y presentación compartida
+    charts.py                        # Gráficos Plotly
+    pages/
+      1_Historial_Trades.py
+      2_Señales_y_Rechazos.py
+      3_Riesgo_y_Exposición.py
+      4_Logs_del_Sistema.py
+    tests/                           # SQLite temporal, mocks y Streamlit AppTest
+```
+
+### Arranque en Windows / PowerShell
+
+Desde la raíz del repositorio, con Python 3.11 o posterior:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+$env:DASHBOARD_DB_PATH = "C:\ruta\al\bot\logs\paper.db"
+.\.venv\Scripts\python.exe -m streamlit run crypto_scalper/dashboard/app.py --server.address 127.0.0.1 --server.fileWatcherType none --client.toolbarMode viewer
+```
+
+En Linux/macOS, después de crear el entorno:
+
+```bash
+.venv/bin/python -m pip install -e '.[dev]'
+export DASHBOARD_DB_PATH=/ruta/al/bot/logs/paper.db
+.venv/bin/python -m streamlit run crypto_scalper/dashboard/app.py --server.address 127.0.0.1 --server.fileWatcherType none --client.toolbarMode viewer
+```
+
+- `--server.fileWatcherType none` desactiva la recarga en caliente. Un servidor
+  de desarrollo que sigue abierto mientras se editan los módulos puede quedarse
+  con una versión antigua de `common.py`/`charts.py` y ejecutar páginas nuevas
+  contra ella (así se produjo el `AttributeError ... require_entrypoint`).
+  Sin vigilante, el proceso ejecuta siempre el código con el que arrancó:
+  **reinícialo después de actualizar el código**.
+- `--client.toolbarMode viewer` oculta el botón «Deploy» y las opciones de
+  desarrollador del menú de Streamlit, que no aplican a los socios.
+- Versión verificada visualmente: Streamlit 1.64.0, Plotly 6.9.0.
+
+Para probar la interfaz sin el bot, genera una base **sintética** con la misma
+fixture de los tests (solo la crea si no existe; `logs/` está fuera de Git):
+
+```powershell
+.\.venv\Scripts\python.exe -c "from pathlib import Path; from crypto_scalper.dashboard.tests.conftest import database; p=Path('logs/dashboard-preview'); p.mkdir(parents=True, exist_ok=True); database.__wrapped__(p) if not (p/'sesión #1.db').exists() else None"
+$env:DASHBOARD_DB_PATH = (Resolve-Path -LiteralPath 'logs/dashboard-preview/sesión #1.db').Path
+```
+
+Abre [el dashboard local](http://localhost:8501). La ruta predeterminada es
+`logs/paper.db`, relativa al directorio desde el que arrancas. Exporta la variable
+en el proceso del dashboard: este no necesita cargar las claves del bot ni su
+`.env`. Si la DB aún no existe, muestra un aviso y vuelve a comprobarla con el
+refresco; nunca crea una DB ni tablas. Para un backtest apunta a su propia SQLite.
+Dos usuarios conectados al mismo servidor conservan filtros independientes y
+comparten los resultados cacheados cuando seleccionan los mismos filtros.
+
+### Vistas y filtros
+
+- **Resumen:** capital y drawdown con ejes separados, PnL realizado acumulado,
+  distribución LONG/SHORT/NEUTRA y aprobaciones/rechazos, y cuatro KPIs.
+- **Historial de trades:** precios de entrada/salida, dirección, PnL bruto, causa
+  y fecha de cierre. El precio de salida es `positions.exit_price` cuando el bot
+  FASE 9 lo guardó (0 = desconocido) o, si no, la orden de salida ejecutada. Si
+  faltan ambos, la celda queda sin
+  valor y la tabla nativa la muestra como «None» (Streamlit no permite cambiar
+  ese texto sin convertir la columna en texto y perder el orden numérico). No
+  se infiere un precio artificial a partir del resultado.
+- **Señales y rechazos:** score, dirección, elegibilidad, motivo y fecha. Una
+  señal elegible con rechazo posterior cuenta como rechazada en el gráfico.
+  «Aprobada» significa elegible LONG/SHORT sin rechazo registrado; no demuestra
+  que se haya ejecutado una orden.
+- **Riesgo y exposición:** nominal bruto actual por símbolo y dirección,
+  posiciones abiertas y máximo drawdown del período completo.
+- **Logs del sistema:** eventos, decisiones de riesgo y reconciliaciones de
+  SQLite. No se leen archivos `.log` ni se envían payloads completos al navegador.
+
+Las fechas se interpretan en **UTC** e incluyen ambos días seleccionados (SQL
+usa inicio inclusivo y medianoche del día siguiente exclusiva). Se filtra por
+fecha de cierre para trades/PnL, de apertura para posiciones abiertas y de
+registro para señales, eventos y heartbeats. El rango es fijo: amplía su final
+para incluir días nuevos cuando dejes abierta una sesión durante varios días.
+Vaciar la selección de símbolos significa «Todos». Los filtros se conservan al
+navegar porque se renderizan una sola vez en el punto de entrada, y también
+cuando un refresco no puede leer la base (bloqueada o ausente): la selección y
+la pausa del refresco se restauran al recuperarse.
+
+Los números propios del dashboard usan separadores españoles (`1.020,00`,
+`2,00 %`) en KPIs, tablas y gráficos; las tablas siguen ordenando por el valor
+numérico. Son nativos de Streamlit, y pueden aparecer en inglés, el menú
+principal, «Select all» del selector de símbolos, «Clear value», la barra de
+la tabla (buscar, descargar CSV, columnas), «Fullscreen», el diálogo «Page not
+found» de una URL inexistente, los atributos de accesibilidad del calendario y
+«None» en celdas sin valor. Streamlit no expone una traducción de esos textos.
+
+Las tablas permiten ordenar cualquier columna, conservando precios y fechas
+como valores tipados. Muestran hasta 100/500/1.000/5.000 filas recientes, según
+el selector; el ordenamiento afecta a las filas cargadas. **Los agregados y el
+PnL acumulado usan todo el intervalo**, independientemente del límite de tabla.
+Los gráficos largos se muestrean hasta 2.001 puntos por serie, preservando los
+extremos; pueden omitir picos intermedios. El máximo drawdown se consulta sobre
+todos los heartbeats. Pausa el refresco para analizar sin interrupciones; el
+zoom de Plotly se conserva entre refrescos con los mismos filtros.
+
+### Semántica del esquema y concurrencia
+
+- `heartbeats` almacena **toda la cartera**, sin símbolo. Capital y drawdown se
+  filtran por fecha y modo y se identifican como globales al seleccionar símbolos.
+  La interfaz muestra la fecha del heartbeat: refrescar la página no genera
+  nuevos datos del bot. Modos diferentes se dibujan como series separadas.
+- En el esquema actual, posiciones, señales y eventos **no tienen columna de
+  modo**. Una selección específica solo incluye esas filas si la base tiene un
+  único modo identificado por sus heartbeats. Si mezcla modos o carece de esa
+  información, se muestran vacías con un aviso. «Todos» permite verlas sin
+  atribuirles un modo. Usa una base por modo/sesión; separar una base mezclada
+  con exactitud requeriría ampliar la persistencia, fuera de este cambio.
+- `positions` conserva el último estado, no un historial de estados. La
+  exposición es la de posiciones **todavía abiertas cuya apertura cumple el
+  filtro**, no una reconstrucción de la cartera en una fecha pasada.
+- El PnL de `positions` es bruto, antes de comisiones y financiación. La curva
+  acumula desde cero al inicio del intervalo. Solo incluye posiciones `CLOSED`
+  con motivo no nulo ni vacío; el valor predeterminado de `close_reason` es `''`.
+- Las lecturas usan URI `mode=ro`, `query_only`, espera de bloqueo de 50 ms y
+  presupuesto de ejecución de 250 ms por consulta. Los cursores y conexiones se
+  cierran incluso ante errores; no se mantienen transacciones largas. Los
+  resultados se cachean cuatro segundos con número de entradas acotado.
+  Consultas distintas pueden observar commits distintos durante un refresco.
+- **Para lectura/escritura concurrente sin bloqueos de lectores se requiere WAL
+  en la base del bot.** El dashboard no ejecuta migraciones, no crea índices ni
+  cambia `journal_mode`. Desde FASE 9, el escritor del bot (`SQLiteRepository`)
+  activa WAL y `busy_timeout` al abrir cualquier base de archivo. Para una base
+  antigua que se lea sin haberla abierto antes con el bot, prepárala con el bot
+  detenido:
+
+  ```powershell
+  # Usa una base existente; DASHBOARD_DB_PATH debe apuntar al archivo correcto.
+  .\.venv\Scripts\python.exe -c "import os, pathlib, sqlite3; p=pathlib.Path(os.environ['DASHBOARD_DB_PATH']).resolve(); c=sqlite3.connect(p.as_uri()+'?mode=rw', uri=True); print(c.execute('PRAGMA journal_mode=WAL').fetchone()[0]); c.close()"
+  ```
+
+  Este paso administrativo separado sí cambia la configuración de SQLite y
+  debe devolver `wal`. El dashboard permanece de solo lectura. Con el modo
+  `delete` original pueden existir bloqueos breves de lectores; no se garantiza
+  aislamiento del escritor en ese modo. No uses `immutable=1` sobre una DB activa.
+  Si una consulta supera su presupuesto, se cancela y la interfaz muestra un
+  aviso; no reintenta en bucle dentro del proceso del bot.
+
+### Verificación sin capital real
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest crypto_scalper/dashboard/tests tests/test_dashboard_data.py tests/test_monitoring.py -q
+```
+
+Las pruebas usan bases temporales y `unittest.mock`, validan las consultas,
+límites UTC, modo ambiguo, PnL, exposición sin cierres, protección de escritura,
+caché/expiración, cierre de conexiones, navegación con filtros compartidos,
+conservación de filtros ante una base bloqueada o ausente y formato numérico.
+`AppTest` ejecuta las cinco páginas sin abrir un servidor ni conectar a Binance;
+complementa, pero no sustituye, la revisión visual en navegador descrita en
+`HANDOFF_PARA_CLAUDE_CODE.md`.
 
 ## Configuración aplicada por defecto
 
@@ -248,7 +429,7 @@ equity/drawdown/exposición, posiciones abiertas, señales recientes y métricas
 | Audit trail (FASE 7) | SQLite en `logs/paper.db` (`PAPER_DB_PATH`) |
 | Alertas Telegram (FASE 8.5) | `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` + `MONITORING_TELEGRAM_ENABLED` (false por defecto) |
 | Cadencia heartbeat (FASE 8.5) | 5 s (`MONITORING_HEARTBEAT_INTERVAL_S`) · cola 256 · cooldown halt 300 s |
-| Dashboard (FASE 8.5) | `streamlit run crypto_scalper/dashboard/app.py` · DB `DASHBOARD_DB_PATH`=`logs/paper.db` |
+| Dashboard (FASE 9) | embebido en el bot: `http://localhost:$PORT/` · API `/api/*` · salud `/healthz` |
 | Lote WS | 20 streams/conexión |
 | Snapshot depth | 100 niveles/símbolo |
 | Feature interval | 1 s |

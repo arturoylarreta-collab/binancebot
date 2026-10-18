@@ -79,6 +79,6 @@ class StopLossCalculator:
         )
 
     def _clamp_distance(self, raw: float, reference_price: float) -> float:
-        min_dist = reference_price * 0.0005
-        max_dist = reference_price * 0.05
+        min_dist = reference_price * self._config.min_stop_pct
+        max_dist = reference_price * self._config.max_stop_pct
         return max(min_dist, min(max_dist, raw))

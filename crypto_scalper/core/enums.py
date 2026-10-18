@@ -80,6 +80,7 @@ class RejectReason(Enum):
     INVALID_STATE = auto()
     DATA_NOT_READY = auto()
     KILL_SWITCH = auto()
+    CONSECUTIVE_LOSSES = auto()
     OTHER = auto()
 
 

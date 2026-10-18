@@ -33,14 +33,17 @@ def ema(values: np.ndarray, period: int) -> float:
 
 
 def rsi(closes: np.ndarray, period: int = 14) -> float:
-    """Wilder's RSI. Returns NaN if fewer than period+1 closes."""
+    """Wilder's RSI (SMA seed, then Wilder smoothing). NaN if < period+1 closes."""
     if len(closes) < period + 1 or period < 1:
         return float("nan")
-    delta = np.diff(closes[-period - 1 :])
+    delta = np.diff(np.asarray(closes, dtype=float))
     gains = np.where(delta > 0, delta, 0.0)
     losses = np.where(delta < 0, -delta, 0.0)
-    avg_gain = float(np.mean(gains))
-    avg_loss = float(np.mean(losses))
+    avg_gain = float(np.mean(gains[:period]))
+    avg_loss = float(np.mean(losses[:period]))
+    for g, l in zip(gains[period:], losses[period:]):
+        avg_gain = (avg_gain * (period - 1) + float(g)) / period
+        avg_loss = (avg_loss * (period - 1) + float(l)) / period
     if avg_loss < _EPS:
         return 100.0 if avg_gain > 0 else 50.0
     rs = avg_gain / avg_loss
@@ -68,8 +71,8 @@ def atr(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) 
 
 
 def adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> float:
-    """Wilder's ADX (+DI/-DI directional index)."""
-    if len(close) < 2 * period or period < 1:
+    """Wilder's ADX: Wilder-smoothed average of the DX series (+DI/-DI)."""
+    if len(close) < 2 * period + 1 or period < 1:
         return float("nan")
     up = np.diff(high)
     down = -np.diff(low)
@@ -77,19 +80,26 @@ def adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) 
     minus_dm = np.where((down > up) & (down > 0), down, 0.0)
     tr = true_range(high, low, close)[1:]
 
-    atr_v = float(np.mean(tr[:period]))
-    plus_s = float(np.mean(plus_dm[:period]))
-    minus_s = float(np.mean(minus_dm[:period]))
+    atr_v = float(np.sum(tr[:period]))
+    plus_s = float(np.sum(plus_dm[:period]))
+    minus_s = float(np.sum(minus_dm[:period]))
 
+    def _dx(p: float, m: float, a: float) -> float:
+        plus_di = 100.0 * p / (a + _EPS)
+        minus_di = 100.0 * m / (a + _EPS)
+        return 100.0 * abs(plus_di - minus_di) / (plus_di + minus_di + _EPS)
+
+    dxs = [_dx(plus_s, minus_s, atr_v)]
     for i in range(period, len(tr)):
-        atr_v = (atr_v * (period - 1) + float(tr[i])) / period
-        plus_s = (plus_s * (period - 1) + float(plus_dm[i])) / period
-        minus_s = (minus_s * (period - 1) + float(minus_dm[i])) / period
+        atr_v = atr_v - atr_v / period + float(tr[i])
+        plus_s = plus_s - plus_s / period + float(plus_dm[i])
+        minus_s = minus_s - minus_s / period + float(minus_dm[i])
+        dxs.append(_dx(plus_s, minus_s, atr_v))
 
-    plus_di = 100.0 * plus_s / (atr_v + _EPS)
-    minus_di = 100.0 * minus_s / (atr_v + _EPS)
-    dx = 100.0 * np.abs(plus_di - minus_di) / ((plus_di + minus_di) + _EPS)
-    return float(dx)
+    adx_v = float(np.mean(dxs[:period]))
+    for d in dxs[period:]:
+        adx_v = (adx_v * (period - 1) + d) / period
+    return adx_v
 
 
 def sma(values: np.ndarray, period: int) -> float:

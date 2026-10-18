@@ -112,7 +112,7 @@ class TestMismatches:
         try:
             await om.submit(OrderRequest(
                 symbol=SYMBOL, side="BUY", order_type=OrderType.LIMIT.name,
-                quantity=0.5, price=40000.0, client_order_id="lone",
+                quantity=0.5, price=40000.0, client_order_id="TP-LONE",
                 requested_ts_ms=1,
             ))
             report = await ReconciliationEngine().reconcile(pm, om, adapter)
